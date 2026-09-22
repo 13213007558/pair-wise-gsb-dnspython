@@ -9,6 +9,7 @@ Dnspython Manual
    rdata
    message
    query
+   authoritative
    resolver
    zone
    zonefile

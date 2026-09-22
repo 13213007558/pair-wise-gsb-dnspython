@@ -56,6 +56,9 @@ Core RFCs
 `RFC 3645 <https://tools.ietf.org/html/rfc3645>`_
     GSS-TSIG.
 
+`RFC 4592 <https://tools.ietf.org/html/rfc4592>`_
+    The Role of Wildcards in the Domain Name System.
+
 `RFC 5936 <https://tools.ietf.org/html/rfc5936>`_
     Zone transfers (AXFR).
 
