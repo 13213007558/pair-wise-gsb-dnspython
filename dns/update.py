@@ -23,12 +23,15 @@ import dns.enum
 import dns.exception
 import dns.message
 import dns.name
+import dns.node
 import dns.opcode
 import dns.rdata
 import dns.rdataclass
+import dns.rcode
 import dns.rdataset
 import dns.rdatatype
 import dns.rrset
+import dns.transaction
 import dns.tsig
 
 
@@ -43,6 +46,16 @@ class UpdateSection(dns.enum.IntEnum):
     @classmethod
     def _maximum(cls):
         return 3
+
+
+def _is_undeletable(
+    rdtype: dns.rdatatype.RdataType, name: dns.name.Name, origin: dns.name.Name
+) -> bool:
+    # The SOA RRset and the zone apex NS RRset may not be deleted by a
+    # dynamic update (RFC 2136 sections 3.4.2.3 - 3.4.2.5).
+    return rdtype == dns.rdatatype.SOA or (
+        rdtype == dns.rdatatype.NS and name == origin
+    )
 
 
 class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
@@ -349,6 +362,178 @@ class UpdateMessage(dns.message.Message):  # lgtm[py/missing-equals]
                 True,
                 True,
             )
+
+    def apply(self, manager: dns.transaction.TransactionManager) -> dns.rcode.Rcode:
+        """Apply the update to a zone, checking prerequisites first.
+
+        This implements the server-side update processing of RFC 2136.  The
+        prerequisites in the message are checked against the zone's content
+        prior to the update, and if they are all satisfied, the update
+        section is applied in a single transaction.  If any prerequisite
+        fails, or if the update section is invalid, the zone is left
+        unchanged.
+
+        Authentication and authorization, e.g. TSIG verification and
+        deciding which identities are allowed to update, are the
+        responsibility of the caller; this method only implements the
+        protocol semantics.
+
+        Note that the zone's SOA serial is not updated; the caller may do
+        this, e.g. with :py:meth:`dns.transaction.Transaction.update_serial`,
+        if desired.
+
+        :param manager: The zone to update, typically a
+            :py:class:`dns.zone.Zone` or :py:class:`dns.versioned.Zone`.
+        :type manager: :py:class:`dns.transaction.TransactionManager`
+        :returns: ``dns.rcode.NOERROR`` if the update was applied, or the
+            rcode corresponding to the failure.
+        :rtype: :py:class:`dns.rcode.Rcode`
+        """
+        if not self.zone:
+            return dns.rcode.FORMERR
+        zone_name = self.zone[0].name
+        if not zone_name.is_absolute():
+            return dns.rcode.FORMERR
+        origin, _, _ = manager.origin_information()
+        if origin is None or zone_name != origin:
+            return dns.rcode.NOTAUTH
+        if self.zone[0].rdclass != manager.get_class():
+            return dns.rcode.FORMERR
+        with manager.writer() as txn:
+            rcode = self._check_prerequisites(txn, origin)
+            if rcode is None:
+                rcode = self._check_update_names(origin)
+            if rcode is not None:
+                txn.rollback()
+                return rcode
+            self._apply_updates(txn, origin)
+        return dns.rcode.NOERROR
+
+    def _absolute_name(self, name: dns.name.Name) -> dns.name.Name:
+        if name.is_absolute():
+            return name
+        assert self.origin is not None
+        return name.derelativize(self.origin)
+
+    def _check_prerequisites(
+        self, txn: dns.transaction.Transaction, origin: dns.name.Name
+    ) -> dns.rcode.Rcode | None:
+        # RFC 2136 section 3.2.  All prerequisites are checked against the
+        # zone as it was before any updates were applied.
+        expected: dict[
+            tuple[dns.name.Name, dns.rdatatype.RdataType, dns.rdatatype.RdataType],
+            set[dns.rdata.Rdata],
+        ] = {}
+        for rrset in self.prerequisite:
+            name = self._absolute_name(rrset.name)
+            if not name.is_subdomain(origin):
+                return dns.rcode.NOTZONE
+            if rrset.deleting is not None:
+                rdclass = rrset.deleting
+            else:
+                rdclass = rrset.rdclass
+            if rdclass == dns.rdataclass.ANY:
+                if rrset.rdtype == dns.rdatatype.ANY:
+                    # Name is in use.
+                    if not txn.name_exists(name):
+                        return dns.rcode.NXDOMAIN
+                elif txn.get(name, rrset.rdtype, rrset.covers) is None:
+                    # RRset exists (value independent).
+                    return dns.rcode.NXRRSET
+            elif rdclass == dns.rdataclass.NONE:
+                if rrset.rdtype == dns.rdatatype.ANY:
+                    # Name is not in use.
+                    if txn.name_exists(name):
+                        return dns.rcode.YXDOMAIN
+                elif txn.get(name, rrset.rdtype, rrset.covers) is not None:
+                    # RRset does not exist.
+                    return dns.rcode.YXRRSET
+            else:
+                # RRset exists (value dependent).  The RRs accumulate into
+                # a set per owner name and type, and are compared below.
+                key = (name, rrset.rdtype, rrset.covers)
+                expected.setdefault(key, set()).update(rrset)
+        for (name, rdtype, covers), rdatas in expected.items():
+            # The comparison is of the sets of RRs, ignoring TTLs and order.
+            existing = txn.get(name, rdtype, covers)
+            if existing is None or set(existing) != rdatas:
+                return dns.rcode.NXRRSET
+        return None
+
+    def _check_update_names(self, origin: dns.name.Name) -> dns.rcode.Rcode | None:
+        # All names in the update section must be within the zone (RFC 2136
+        # section 3.4.2.1).  This is checked before applying anything so that
+        # a bad name cannot leave a partially applied update behind.
+        for rrset in self.update:
+            if not self._absolute_name(rrset.name).is_subdomain(origin):
+                return dns.rcode.NOTZONE
+        return None
+
+    def _apply_updates(
+        self, txn: dns.transaction.Transaction, origin: dns.name.Name
+    ) -> None:
+        # RFC 2136 section 3.4.2.
+        for rrset in self.update:
+            name = self._absolute_name(rrset.name)
+            if rrset.deleting == dns.rdataclass.ANY:
+                if rrset.rdtype == dns.rdatatype.ANY:
+                    self._delete_name(txn, name, origin)
+                elif not _is_undeletable(rrset.rdtype, name, origin):
+                    # Delete an RRset.
+                    txn.delete(name, rrset.rdtype, rrset.covers)
+            elif rrset.deleting == dns.rdataclass.NONE:
+                if not _is_undeletable(rrset.rdtype, name, origin):
+                    # Delete RRs from an RRset.  It is not an error if some
+                    # of the RRs do not exist.
+                    txn.delete(name, rrset.to_rdataset())
+            else:
+                self._add_rrset(txn, name, rrset, origin)
+
+    def _delete_name(
+        self,
+        txn: dns.transaction.Transaction,
+        name: dns.name.Name,
+        origin: dns.name.Name,
+    ) -> None:
+        # Delete all RRsets at a name, except that the SOA and NS RRsets at
+        # the zone apex are not deleted (RFC 2136 section 3.4.2.5).
+        if name == origin:
+            node = txn.get_node(name)
+            if node is not None:
+                for rdataset in list(node.rdatasets):
+                    if not _is_undeletable(rdataset.rdtype, name, origin):
+                        txn.delete(name, rdataset.rdtype, rdataset.covers)
+        else:
+            txn.delete(name)
+
+    def _add_rrset(
+        self,
+        txn: dns.transaction.Transaction,
+        name: dns.name.Name,
+        rrset: dns.rrset.RRset,
+        origin: dns.name.Name,
+    ) -> None:
+        # Add RRs to an RRset (RFC 2136 section 3.4.2.2).  Adds that would
+        # mix a CNAME with other data, or add an SOA away from the zone
+        # apex, are ignored.
+        if rrset.rdtype == dns.rdatatype.SOA and name != origin:
+            return
+        node = txn.get_node(name)
+        if node is not None:
+            kinds = {
+                dns.node.NodeKind.classify_rdataset(rdataset)
+                for rdataset in node.rdatasets
+            }
+            if rrset.rdtype == dns.rdatatype.CNAME:
+                if dns.node.NodeKind.REGULAR in kinds:
+                    return
+            elif (
+                dns.node.NodeKind.classify(rrset.rdtype, rrset.covers)
+                == dns.node.NodeKind.REGULAR
+                and dns.node.NodeKind.CNAME in kinds
+            ):
+                return
+        txn.add(name, rrset.to_rdataset())
 
     def _get_one_rr_per_rrset(self, value):
         # Updates are always one_rr_per_rrset
