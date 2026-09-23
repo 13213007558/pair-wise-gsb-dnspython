@@ -21,6 +21,7 @@
 
 import base64
 import contextlib
+import enum
 import functools
 import hashlib
 import struct
@@ -30,8 +31,10 @@ from datetime import datetime
 from typing import Union, cast
 
 import dns._features
+import dns.message
 import dns.name
 import dns.node
+import dns.rcode
 import dns.rdata
 import dns.rdataclass
 import dns.rdataset
@@ -442,6 +445,360 @@ def _validate(
         except (ValidationFailure, UnsupportedAlgorithm):
             pass
     raise ValidationFailure("no RRSIGs validated")
+
+
+class DenialOfExistence(enum.IntEnum):
+    """The result of an offline NSEC denial-of-existence validation."""
+
+    VALID = 0
+    """The denial of existence is proven."""
+
+    INSUFFICIENT = 1
+    """The NSEC records in the response are insufficient to prove the
+    denial of existence."""
+
+    BOGUS = 2
+    """Validation failed; a signature did not validate, or a validated
+    NSEC record contradicts the denial of existence."""
+
+
+class DenialOfExistenceResult:
+    """The result of an offline NSEC denial-of-existence validation.
+
+    .. attribute:: result
+
+        The :py:class:`dns.dnssec.DenialOfExistence` outcome.
+
+    .. attribute:: rrsets
+
+        A list of the NSEC and RRSIG :py:class:`dns.rrset.RRset` objects
+        used in the determination.
+
+    .. attribute:: reason
+
+        A human-readable description of the determination.
+    """
+
+    def __init__(
+        self,
+        result: DenialOfExistence,
+        rrsets: list[dns.rrset.RRset],
+        reason: str,
+    ):
+        self.result = result
+        self.rrsets = rrsets
+        self.reason = reason
+
+    def __repr__(self):
+        return f"<DenialOfExistenceResult {self.result.name}: {self.reason}>"
+
+
+def _nsec_bitmap_has_type(nsec: NSEC, rdtype: dns.rdatatype.RdataType) -> bool:
+    """Is *rdtype* present in the type bitmap of *nsec*?"""
+    window = rdtype // 256
+    bit = rdtype % 256
+    for window_id, bitmap in nsec.windows:
+        if window_id == window:
+            octet = bit // 8
+            return octet < len(bitmap) and bool(bitmap[octet] & (0x80 >> (bit % 8)))
+    return False
+
+
+def _nsec_covers(
+    owner: dns.name.Name, next_name: dns.name.Name, name: dns.name.Name
+) -> bool:
+    """Is *name* strictly between *owner* and *next_name* in DNS canonical
+    name order?
+
+    An interval whose next name does not sort after its owner wraps around
+    the end of the zone back to the zone apex.
+    """
+    if owner < next_name:
+        return owner < name < next_name
+    # The interval wraps around the end of the zone.
+    return name > owner or name < next_name
+
+
+def _nsec_closest_encloser(
+    qname: dns.name.Name, nsec_owner: dns.name.Name
+) -> dns.name.Name:
+    """Compute the closest encloser of *qname* given the owner name of the
+    NSEC that covers it.  The closest encloser is the longest common
+    ancestor of the two names."""
+    _, _, nlabels = qname.fullcompare(nsec_owner)
+    return dns.name.Name(qname.labels[len(qname.labels) - nlabels :])
+
+
+def _validate_denial_of_existence(
+    question: (
+        dns.rrset.RRset
+        | tuple[dns.name.Name, dns.rdatatype.RdataType | int]
+        | dns.message.Message
+    ),
+    response: dns.message.Message,
+    keys: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset],
+    now: float | None = None,
+    policy: Policy | None = None,
+) -> DenialOfExistenceResult:
+    """Offline validation of the NSEC denial-of-existence proof in a
+    negative response, following RFC 4035 section 5.4 and the applicable
+    RFC 6840 clarifications.
+
+    The RRSIGs of the applicable NSEC records are validated against the
+    trusted keys first, and the NSEC proof is evaluated afterwards.  Only
+    plain NSEC records are considered; NSEC3 proofs and building a chain of
+    trust from the root are out of scope.  Supported proofs are NXDOMAIN,
+    NODATA for an exact qname match, and the exclusion of a matching
+    wildcard as part of an NXDOMAIN proof.
+
+    :param question: The question, as a :py:class:`dns.rrset.RRset` (e.g.
+        an element of a message's question section), a
+        (:py:class:`dns.name.Name`, rdatatype) tuple, or a query
+        :py:class:`dns.message.Message`.
+    :param response: The response message containing the NSEC and RRSIG
+        records of the denial-of-existence proof in its authority section.
+    :type response: :py:class:`dns.message.Message`
+    :param keys: The trusted DNSKEYs of the zone, keyed by
+        :py:class:`dns.name.Name`, with :py:class:`dns.node.Node` or
+        :py:class:`dns.rdataset.Rdataset` values.
+    :param now: The validation time in seconds since the epoch. If
+        ``None``, the actual current time is used.
+    :type now: float or ``None``
+    :param policy: The policy to use when validating signatures. If
+        ``None``, ``dns.dnssec.default_policy`` is used.
+    :type policy: :py:class:`dns.dnssec.Policy` or ``None``
+    :returns: A :py:class:`dns.dnssec.DenialOfExistenceResult`; its
+        ``result`` attribute is ``DenialOfExistence.VALID`` if the
+        denial of existence is proven, ``DenialOfExistence.INSUFFICIENT``
+        if the NSEC records do not establish the proof, and
+        ``DenialOfExistence.BOGUS`` if validation failed.
+    """
+
+    if policy is None:
+        policy = default_policy
+
+    if isinstance(question, dns.message.Message):
+        if not question.question:
+            raise ValueError("question message has an empty question section")
+        question = question.question[0]
+    if isinstance(question, tuple):
+        qname, qtype = question
+        qclass = dns.rdataclass.IN
+    else:
+        qname, qtype, qclass = question.name, question.rdtype, question.rdclass
+    qtype = dns.rdatatype.RdataType.make(qtype)
+    qclass = dns.rdataclass.RdataClass.make(qclass)
+
+    def _result(
+        result: DenialOfExistence,
+        rrsets: list[dns.rrset.RRset],
+        reason: str,
+    ) -> DenialOfExistenceResult:
+        return DenialOfExistenceResult(result, rrsets, reason)
+
+    rcode = response.rcode()
+    if rcode == dns.rcode.Rcode.NXDOMAIN:
+        nxdomain = True
+    elif rcode == dns.rcode.Rcode.NOERROR and len(response.answer) == 0:
+        nxdomain = False
+    else:
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            [],
+            "response is not a negative answer",
+        )
+
+    # The deepest trusted zone containing the qname is the zone whose NSECs
+    # are relevant; NSECs or signatures from any other zone cannot prove
+    # anything about this qname.
+    zones = [name for name in keys if qname.is_subdomain(name)]
+    if not zones:
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            [],
+            "qname is not below any trusted zone",
+        )
+    zone = max(zones, key=lambda name: len(name.labels))
+
+    nsec_rrsets: dict[dns.name.Name, dns.rrset.RRset] = {}
+    rrsig_rrsets: dict[dns.name.Name, list[dns.rrset.RRset]] = {}
+    for rrset in response.authority:
+        if rrset.rdclass != qclass:
+            continue
+        if (
+            rrset.rdtype == dns.rdatatype.NSEC
+            and rrset.name.is_subdomain(zone)
+            and rrset.name not in nsec_rrsets
+        ):
+            nsec_rrsets[rrset.name] = rrset
+        elif rrset.rdtype == dns.rdatatype.RRSIG and rrset.covers == dns.rdatatype.NSEC:
+            rrsig_rrsets.setdefault(rrset.name, []).append(rrset)
+
+    if not nsec_rrsets:
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            [],
+            "response has no applicable NSEC records",
+        )
+
+    # Validate the RRSIGs of all applicable NSECs before evaluating the
+    # proof.  Only signatures made by this zone's own keys are usable.
+    validated: dict[dns.name.Name, tuple[dns.rrset.RRset, dns.rrset.RRset]] = {}
+    for name, nsec_rrset in nsec_rrsets.items():
+        rdataset = dns.rdataset.Rdataset(qclass, dns.rdatatype.RRSIG)
+        for rrsig_rrset in rrsig_rrsets.get(name, []):
+            for rrsig in rrsig_rrset:
+                if isinstance(rrsig, RRSIG) and rrsig.signer == zone:
+                    rdataset.add(rrsig, rrsig_rrset.ttl)
+        if len(rdataset) == 0:
+            return _result(
+                DenialOfExistence.BOGUS,
+                [nsec_rrset],
+                f"NSEC {name} has no RRSIG from zone {zone}",
+            )
+        try:
+            _validate(nsec_rrset, (name, rdataset), keys, None, now, policy)
+        except (ValidationFailure, UnsupportedAlgorithm) as e:
+            return _result(
+                DenialOfExistence.BOGUS,
+                [nsec_rrset],
+                f"NSEC {name} did not validate: {e}",
+            )
+        validated[name] = (
+            nsec_rrset,
+            dns.rrset.from_rdata(name, rdataset.ttl, *rdataset),
+        )
+
+    def _used(*names: dns.name.Name) -> list[dns.rrset.RRset]:
+        rrsets = []
+        for name in names:
+            nsec_rrset, rrsig_rrset = validated[name]
+            rrsets.extend([nsec_rrset, rrsig_rrset])
+        return rrsets
+
+    def _all_used() -> list[dns.rrset.RRset]:
+        return _used(*validated)
+
+    def _find_covering(name: dns.name.Name) -> dns.name.Name | None:
+        for owner, (rrset, _) in validated.items():
+            for rdata in rrset:
+                nsec = cast(NSEC, rdata)
+                if _nsec_covers(owner, nsec.next, name):
+                    return owner
+        return None
+
+    def _is_delegation(rrset: dns.rrset.RRset) -> bool:
+        # An NSEC with the NS bit set but the SOA bit clear is at a
+        # delegation point, i.e. at the boundary of the zone.
+        nsec = cast(NSEC, rrset[0])
+        return _nsec_bitmap_has_type(
+            nsec, dns.rdatatype.NS
+        ) and not _nsec_bitmap_has_type(nsec, dns.rdatatype.SOA)
+
+    if nxdomain:
+        if qname in validated:
+            return _result(
+                DenialOfExistence.BOGUS,
+                _used(qname),
+                f"an NSEC proves that {qname} exists",
+            )
+        covering = _find_covering(qname)
+        if covering is None:
+            return _result(
+                DenialOfExistence.INSUFFICIENT,
+                _all_used(),
+                f"no NSEC covers {qname}",
+            )
+        if (
+            qname != covering
+            and qname.is_subdomain(covering)
+            and _is_delegation(validated[covering][0])
+        ):
+            # A name below a delegation is out of this zone; the zone's
+            # NSECs cannot prove anything about it.
+            return _result(
+                DenialOfExistence.INSUFFICIENT,
+                _used(covering),
+                f"{qname} is below the delegation {covering}",
+            )
+        closest_encloser = _nsec_closest_encloser(qname, covering)
+        wildcard = dns.name.Name((b"*",) + closest_encloser.labels)
+        if wildcard in validated:
+            return _result(
+                DenialOfExistence.BOGUS,
+                _used(covering, wildcard),
+                f"an NSEC proves that the wildcard {wildcard} exists",
+            )
+        wildcard_covering = _find_covering(wildcard)
+        if wildcard_covering is None:
+            return _result(
+                DenialOfExistence.INSUFFICIENT,
+                _used(covering),
+                f"no NSEC excludes the wildcard {wildcard}",
+            )
+        if wildcard_covering == covering:
+            used = _used(covering)
+        else:
+            used = _used(covering, wildcard_covering)
+        return _result(
+            DenialOfExistence.VALID,
+            used,
+            f"NSECs prove {qname} does not exist and exclude {wildcard}",
+        )
+
+    # NODATA for an exact qname match.
+    if qname not in validated:
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            _all_used(),
+            f"no NSEC matches {qname}",
+        )
+    nsec_rrset, _ = validated[qname]
+    nsec = cast(NSEC, nsec_rrset[0])
+    if _nsec_bitmap_has_type(nsec, qtype):
+        return _result(
+            DenialOfExistence.BOGUS,
+            _used(qname),
+            f"the NSEC type bitmap of {qname} contains {dns.rdatatype.to_text(qtype)}",
+        )
+    if _nsec_bitmap_has_type(nsec, dns.rdatatype.CNAME):
+        # RFC 6840 section 4.1: an NSEC with the CNAME bit set does not
+        # prove the nonexistence of any other type, as the CNAME would
+        # have been followed.
+        return _result(
+            DenialOfExistence.BOGUS,
+            _used(qname),
+            f"the NSEC type bitmap of {qname} contains CNAME",
+        )
+    if _is_delegation(nsec_rrset):
+        if qtype == dns.rdatatype.DS:
+            # The NSEC at the delegation proves there is no DS record,
+            # i.e. the delegation is insecure.
+            return _result(
+                DenialOfExistence.VALID,
+                _used(qname),
+                f"NSEC proves the delegation {qname} has no DS record",
+            )
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            _used(qname),
+            f"{qname} is a delegation; its NSEC cannot prove NODATA for "
+            f"{dns.rdatatype.to_text(qtype)}",
+        )
+    if qtype == dns.rdatatype.DS:
+        # DS records live in the parent zone; this zone's NSEC at the
+        # qname cannot prove their nonexistence.
+        return _result(
+            DenialOfExistence.INSUFFICIENT,
+            _used(qname),
+            f"the NSEC at {qname} is not a delegation NSEC and cannot "
+            "prove the nonexistence of DS",
+        )
+    return _result(
+        DenialOfExistence.VALID,
+        _used(qname),
+        f"NSEC proves {qname} has no {dns.rdatatype.to_text(qtype)} data",
+    )
 
 
 def _sign(
@@ -1147,6 +1504,7 @@ if dns._features.have("dnssec"):
 
     validate = _validate  # pyright: ignore
     validate_rrsig = _validate_rrsig  # pyright: ignore
+    validate_denial_of_existence = _validate_denial_of_existence  # pyright: ignore
     sign = _sign
     make_dnskey = _make_dnskey
     make_cdnskey = _make_cdnskey
@@ -1154,6 +1512,7 @@ if dns._features.have("dnssec"):
 else:  # pragma: no cover
     validate = _need_pyca
     validate_rrsig = _need_pyca
+    validate_denial_of_existence = _need_pyca
     sign = _need_pyca
     make_dnskey = _need_pyca
     make_cdnskey = _need_pyca

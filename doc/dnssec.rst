@@ -20,6 +20,7 @@ DNSSEC Functions
 .. autofunction:: dns.dnssec.sign
 .. autofunction:: dns.dnssec.validate
 .. autofunction:: dns.dnssec.validate_rrsig
+.. autofunction:: dns.dnssec.validate_denial_of_existence
 .. autofunction:: dns.dnssec.nsec3_hash
 .. autofunction:: dns.dnssec.make_ds_rdataset()
 .. autofunction:: dns.dnssec.cds_rdataset_to_ds_rdataset()
@@ -32,6 +33,15 @@ DNSSEC Policy
 -------------
 
 .. autoclass:: dns.dnssec.Policy
+   :members:
+
+DNSSEC Denial of Existence
+--------------------------
+
+.. autoclass:: dns.dnssec.DenialOfExistence
+   :members:
+
+.. autoclass:: dns.dnssec.DenialOfExistenceResult
    :members:
 
 DNSSEC Algorithm Types
