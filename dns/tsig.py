@@ -30,19 +30,40 @@ import dns.rdatatype
 
 
 class BadTime(dns.exception.DNSException):
-    """The current time is not within the TSIG's validity time."""
+    """The current time is not within the TSIG's validity time.
+
+    If the ``server_time`` attribute is not ``None``, it is the validating
+    party's current time, and may be used by the peer to calibrate a skewed
+    clock.  Note that a ``BadTime`` result is never a successful validation.
+    """
+
+    supp_kwargs = {"server_time"}
+    fmt = "TSIG time is out of range; server time is {server_time}"
+
+    rcode = dns.rcode.BADTIME
+
+    @property
+    def server_time(self):
+        """The validating party's current time, or ``None`` if not known."""
+        return self.kwargs.get("server_time")
 
 
 class BadSignature(dns.exception.DNSException):
     """The TSIG signature fails to verify."""
 
+    rcode = dns.rcode.BADSIG
+
 
 class BadKey(dns.exception.DNSException):
     """The TSIG record owner name does not match the key."""
 
+    rcode = dns.rcode.BADKEY
+
 
 class BadAlgorithm(dns.exception.DNSException):
     """The TSIG algorithm does not match the key."""
+
+    rcode = dns.rcode.BADALG
 
 
 class PeerError(dns.exception.DNSException):
@@ -310,8 +331,85 @@ def validate(
     ctx = _digest(new_wire, key, rdata, None, request_mac, ctx, multi)
     ctx.verify(rdata.mac)
     if abs(rdata.time_signed - now) > rdata.fudge:
-        raise BadTime
+        raise BadTime(server_time=now)
     return _maybe_start_digest(key, rdata.mac, multi)
+
+
+class ValidationResult:
+    """The result of a TSIG validation attempt.
+
+    This is a classifiable, non-raising alternative to the exceptions
+    raised by :py:func:`validate`.  It never contains the key's secret.
+    """
+
+    def __init__(
+        self, ok, error=None, rcode=None, server_time=None, ctx=None, key_name=None
+    ):
+        #: `True` if and only if the TSIG validated completely.  A
+        #: `BADTIME` result is not a successful validation.
+        self.ok = ok
+        #: The error category, one of `"BADKEY"`, `"BADALG"`, `"BADSIG"`,
+        #: or `"BADTIME"`, or `None` if validation succeeded.
+        self.error = error
+        #: The TSIG error code classifying the result, e.g.
+        #: `dns.rcode.BADTIME`, or `None` if validation succeeded.
+        self.rcode = rcode
+        #: The validating party's current time, set only for `BADTIME`
+        #: results so the peer can calibrate a skewed clock.
+        self.server_time = server_time
+        #: The TSIG continuation context for multi-message sequences, set
+        #: only when validation succeeded.
+        self.ctx = ctx
+        #: The name of the key selected for validation.
+        self.key_name = key_name
+
+    def __bool__(self):
+        return self.ok
+
+    def __repr__(self):
+        if self.ok:
+            return f"<ValidationResult ok key_name='{self.key_name}'>"
+        else:
+            return f"<ValidationResult {self.error} key_name='{self.key_name}'>"
+
+
+def validate_with_result(
+    wire, key, owner, rdata, now, request_mac, tsig_start, ctx=None, multi=False
+):
+    """Validate the specified TSIG rdata, returning a classifiable result
+    instead of raising.
+
+    The parameters are as for :py:func:`validate`, except that *key* may
+    be `None`, in which case a `BADKEY` result is returned.
+
+    A `BADTIME` result includes the server's current time in the result's
+    `server_time` attribute, but is not a successful validation; in
+    particular no continuation context is produced.
+
+    Errors reported by the remote peer (e.g. `PeerBadTime`) are still
+    raised as exceptions.
+
+    @rtype: dns.tsig.ValidationResult
+    """
+
+    if key is None:
+        return ValidationResult(False, "BADKEY", dns.rcode.BADKEY, key_name=owner)
+    try:
+        new_ctx = validate(
+            wire, key, owner, rdata, now, request_mac, tsig_start, ctx, multi
+        )
+    except BadTime as e:
+        server_time = e.server_time if e.server_time is not None else now
+        return ValidationResult(
+            False, "BADTIME", dns.rcode.BADTIME, server_time, key_name=key.name
+        )
+    except BadSignature:
+        return ValidationResult(False, "BADSIG", dns.rcode.BADSIG, key_name=key.name)
+    except BadAlgorithm:
+        return ValidationResult(False, "BADALG", dns.rcode.BADALG, key_name=key.name)
+    except BadKey:
+        return ValidationResult(False, "BADKEY", dns.rcode.BADKEY, key_name=key.name)
+    return ValidationResult(True, ctx=new_ctx, key_name=key.name)
 
 
 def get_context(key):

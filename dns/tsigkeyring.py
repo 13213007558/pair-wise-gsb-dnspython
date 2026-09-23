@@ -20,6 +20,7 @@
 import base64
 import os
 import re
+import time
 from typing import Any
 from pathlib import Path
 import dns.name
@@ -102,3 +103,105 @@ def to_text(keyring: dict[dns.name.Name, Any]) -> dict[str, Any]:
 
             textring[tname] = (key.algorithm.to_text(), text_secret)
     return textring
+
+
+class RotationKey:
+    """A TSIG key with an associated validity interval.
+
+    The key is valid for message signing times `t` with
+    ``not_before <= t < not_after``; a `None` bound is open-ended.
+    """
+
+    def __init__(
+        self,
+        key: dns.tsig.Key,
+        not_before: int | None = None,
+        not_after: int | None = None,
+    ):
+        self.key = key
+        self.not_before = not_before
+        self.not_after = not_after
+
+    @property
+    def name(self) -> dns.name.Name:
+        return self.key.name
+
+    @property
+    def algorithm(self) -> dns.name.Name:
+        return self.key.algorithm
+
+    def valid_at(self, when: int) -> bool:
+        """Is the key valid at the specified time?"""
+        if self.not_before is not None and when < self.not_before:
+            return False
+        if self.not_after is not None and when >= self.not_after:
+            return False
+        return True
+
+    def __repr__(self):
+        return (
+            f"<RotationKey name='{self.name}', algorithm='{self.algorithm}', "
+            f"not_before={self.not_before}, not_after={self.not_after}>"
+        )
+
+
+class RotationKeyring:
+    """A TSIG keyring supporting rotation between a current and a
+    previous key.
+
+    Each key has its own algorithm and validity interval.  When
+    validating a message, exactly one key is selected, based on the
+    message's signing time rather than the local clock; if verification
+    with the selected key fails, there is no fallback to the other key.
+    When signing, the key valid at the current local time is used.
+    """
+
+    def __init__(
+        self,
+        current: RotationKey | dns.tsig.Key,
+        previous: RotationKey | dns.tsig.Key | None = None,
+    ):
+        def ensure_rotation_key(k):
+            if isinstance(k, dns.tsig.Key):
+                return RotationKey(k)
+            return k
+
+        self.current = ensure_rotation_key(current)
+        if previous is not None:
+            previous = ensure_rotation_key(previous)
+        self.previous = previous
+
+    def _keys(self):
+        return [k for k in (self.current, self.previous) if k is not None]
+
+    def get_key(self, keyname: dns.name.Name, time_signed: int) -> dns.tsig.Key | None:
+        """Return the single key to use for a message with the specified
+        key name and signing time, or `None` if there is no such key.
+
+        The current key is preferred if both keys are valid at
+        *time_signed*.
+        """
+        for rotation_key in self._keys():
+            if rotation_key.name == keyname and rotation_key.valid_at(time_signed):
+                return rotation_key.key
+        return None
+
+    def __getitem__(self, keyname: dns.name.Name) -> dns.tsig.Key:
+        # Signing path; select by the current local time.
+        key = self.get_key(keyname, int(time.time()))
+        if key is None:
+            raise KeyError(keyname)
+        return key
+
+    def __iter__(self):
+        seen = set()
+        for rotation_key in self._keys():
+            if rotation_key.name not in seen:
+                seen.add(rotation_key.name)
+                yield rotation_key.name
+
+    def __contains__(self, keyname: dns.name.Name) -> bool:
+        return any(k.name == keyname for k in self._keys())
+
+    def __repr__(self):
+        return f"<RotationKeyring current={self.current!r} previous={self.previous!r}>"

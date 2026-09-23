@@ -47,6 +47,9 @@ Core RFCs
 `RFC 2845 <https://tools.ietf.org/html/rfc2845>`_
     Transaction Signatures (TSIG)
 
+`RFC 8945 <https://tools.ietf.org/html/rfc8945>`_
+    Secret Key Transaction Authentication for DNS (TSIG)
+
 `RFC 3007 <https://tools.ietf.org/html/rfc3007>`_
     Dynamic Updates
 
