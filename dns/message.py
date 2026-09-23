@@ -22,7 +22,7 @@ import enum
 import io
 import os
 import time
-from typing import Any, TextIO, cast
+from typing import Any, Iterable, TextIO, cast
 
 import dns._file_util
 import dns.edns
@@ -909,6 +909,97 @@ class Message:
     def get_options(self, otype: dns.edns.OptionType) -> list[dns.edns.Option]:
         """Return the list of options of the specified type."""
         return [option for option in self.options if option.otype == otype]
+
+    def _set_options(self, options: Iterable[dns.edns.Option]) -> None:
+        """Replace the EDNS option list, preserving EDNS level, flags, and
+        payload.  EDNS0 with default parameters is enabled if EDNS is not
+        already in use.
+        """
+        if self.opt is None:
+            self.use_edns(0, 0, DEFAULT_EDNS_PAYLOAD, options=list(options))
+        else:
+            self.opt = self._make_opt(self.ednsflags, self.payload, list(options))
+
+    def delete_options(self, otype: dns.edns.OptionType | str | int) -> int:
+        """Delete all EDNS options of the specified type.
+
+        The relative order of the remaining options is preserved.  If the
+        message does not use EDNS, or has no options of the specified type,
+        the message is left unchanged.
+
+        :param otype: The option type to delete.
+        :type otype: :py:class:`dns.edns.OptionType`, ``str``, or ``int``
+        :returns: The number of options deleted.
+        :rtype: int
+        """
+        otype = dns.edns.OptionType.make(otype)
+        kept = [option for option in self.options if option.otype != otype]
+        deleted = len(self.options) - len(kept)
+        if deleted:
+            self._set_options(kept)
+        return deleted
+
+    def replace_options(
+        self,
+        otype: dns.edns.OptionType | str | int,
+        options: Iterable[dns.edns.Option],
+    ) -> None:
+        """Replace all EDNS options of the specified type.
+
+        The replacements are inserted at the position of the first option
+        of the specified type; if no such option is present, they are
+        appended at the end of the option list.  The relative order of
+        options of other types is preserved.  All replacements must have
+        the specified option type.  If EDNS is not in use and there are
+        replacements, EDNS0 with default parameters is enabled; if there
+        is nothing to replace and no replacements, the message is left
+        unchanged.
+
+        :param otype: The option type to replace.
+        :type otype: :py:class:`dns.edns.OptionType`, ``str``, or ``int``
+        :param options: The replacement options.
+        :type options: iterable of :py:class:`dns.edns.Option`
+        :raises ValueError: If a replacement is not a
+            :py:class:`dns.edns.Option` of the specified type.
+        """
+        otype = dns.edns.OptionType.make(otype)
+        replacements = []
+        for option in options:
+            if not isinstance(option, dns.edns.Option):
+                raise ValueError("replacement is not a dns.edns.Option")
+            if option.otype != otype:
+                raise ValueError("replacement has the wrong option type")
+            replacements.append(option)
+        new: list[dns.edns.Option] = []
+        inserted = False
+        for option in self.options:
+            if option.otype == otype:
+                if not inserted:
+                    new.extend(replacements)
+                    inserted = True
+            else:
+                new.append(option)
+        if not inserted:
+            if not replacements and self.opt is None:
+                # Nothing to replace and nothing to add; don't enable EDNS.
+                return
+            new.extend(replacements)
+        self._set_options(new)
+
+    def append_option(self, option: dns.edns.Option) -> None:
+        """Append an EDNS option at the end of the option list.
+
+        The option is added after all existing options, preserving their
+        relative order.  If EDNS is not in use, EDNS0 with default
+        parameters is enabled.
+
+        :param option: The option to append.
+        :type option: :py:class:`dns.edns.Option`
+        :raises ValueError: If *option* is not a :py:class:`dns.edns.Option`.
+        """
+        if not isinstance(option, dns.edns.Option):
+            raise ValueError("option is not a dns.edns.Option")
+        self._set_options([*self.options, option])
 
     def extended_errors(self) -> list[dns.edns.EDEOption]:
         """Return the list of Extended DNS Error (EDE) options in the message"""

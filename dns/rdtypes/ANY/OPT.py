@@ -56,6 +56,11 @@ class OPT(dns.rdata.Rdata):
     def _to_wire(self, file, compress=None, origin=None, canonicalize=False):
         for opt in self.options:
             owire = opt.to_wire()
+            if len(owire) > 65535:
+                raise dns.exception.TooBig(
+                    f"EDNS option {opt.otype} data is too long "
+                    f"({len(owire)} > 65535)"
+                )
             file.write(struct.pack("!HH", opt.otype, len(owire)))
             file.write(owire)
 

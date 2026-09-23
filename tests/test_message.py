@@ -1026,5 +1026,246 @@ www.dnspython.org. 300 IN A 1.2.3.4
         self.assertEqual(r.extended_errors(), options)
 
 
+class MessageEDNSOptionsTestCase(unittest.TestCase):
+    """Preservation and editing of EDNS options, including unknown ones."""
+
+    private = 65001  # private-use option code
+
+    def make_query_with_options(self):
+        q = dns.message.make_query("example.com", "A")
+        q.use_edns(
+            0,
+            0,
+            1232,
+            options=[
+                dns.edns.GenericOption(self.private, b"\x01\x02\x03"),
+                dns.edns.GenericOption(dns.edns.OptionType.PADDING, b"\x00" * 4),
+                dns.edns.CookieOption(b"12345678", b""),
+                dns.edns.GenericOption(self.private, b"\x04\x05"),
+            ],
+        )
+        return q
+
+    def test_unknown_options_round_trip_byte_exact(self):
+        q = self.make_query_with_options()
+        wire = q.to_wire()
+        q2 = dns.message.from_wire(wire)
+        # Unmodified messages re-encode to the identical bytes.
+        self.assertEqual(q2.to_wire(), wire)
+        # Order and duplicates are preserved; unknown options keep their
+        # code and raw payload, known ones are parsed into dedicated types.
+        options = q2.options
+        self.assertEqual(len(options), 4)
+        self.assertIsInstance(options[0], dns.edns.GenericOption)
+        self.assertEqual(options[0].otype, self.private)
+        self.assertEqual(options[0].data, b"\x01\x02\x03")
+        self.assertIsInstance(options[1], dns.edns.GenericOption)
+        self.assertEqual(options[1].otype, dns.edns.OptionType.PADDING)
+        self.assertEqual(options[1].data, b"\x00" * 4)
+        self.assertIsInstance(options[2], dns.edns.CookieOption)
+        self.assertIsInstance(options[3], dns.edns.GenericOption)
+        self.assertEqual(options[3].otype, self.private)
+        self.assertEqual(options[3].data, b"\x04\x05")
+
+    def test_duplicate_codes_not_clobbered(self):
+        q = self.make_query_with_options()
+        q2 = dns.message.from_wire(q.to_wire())
+        private_options = q2.get_options(self.private)
+        self.assertEqual(len(private_options), 2)
+        self.assertEqual(private_options[0].data, b"\x01\x02\x03")
+        self.assertEqual(private_options[1].data, b"\x04\x05")
+
+    def test_delete_options(self):
+        q = self.make_query_with_options()
+        wire_before = q.to_wire()
+        deleted = q.delete_options(self.private)
+        self.assertEqual(deleted, 2)
+        self.assertEqual(
+            [o.otype for o in q.options],
+            [dns.edns.OptionType.PADDING, dns.edns.OptionType.COOKIE],
+        )
+        # The new wire form differs only by the removal of the private
+        # options.
+        expected = dns.message.make_query("example.com", "A")
+        expected.id = q.id
+        expected.use_edns(
+            0,
+            0,
+            1232,
+            options=[
+                dns.edns.GenericOption(dns.edns.OptionType.PADDING, b"\x00" * 4),
+                dns.edns.CookieOption(b"12345678", b""),
+            ],
+        )
+        self.assertEqual(q.to_wire(), expected.to_wire())
+        # Deleting a code that is not present changes nothing.
+        self.assertEqual(q.delete_options(65002), 0)
+        self.assertEqual(q.to_wire(), expected.to_wire())
+        # And the original wire is not equal to the edited wire.
+        self.assertNotEqual(q.to_wire(), wire_before)
+
+    def test_delete_options_no_edns(self):
+        q = dns.message.make_query("example.com", "A")
+        wire = q.to_wire()
+        self.assertEqual(q.delete_options(self.private), 0)
+        self.assertEqual(q.edns, -1)
+        self.assertEqual(q.to_wire(), wire)
+
+    def test_replace_options(self):
+        q = self.make_query_with_options()
+        q.replace_options(self.private, [dns.edns.GenericOption(self.private, b"\x09")])
+        # The replacement takes the position of the first replaced option.
+        self.assertEqual(
+            [o.otype for o in q.options],
+            [self.private, dns.edns.OptionType.PADDING, dns.edns.OptionType.COOKIE],
+        )
+        self.assertEqual(q.options[0].data, b"\x09")
+        # Replacing with an empty list is equivalent to deletion.
+        q.replace_options(self.private, [])
+        self.assertEqual(
+            [o.otype for o in q.options],
+            [dns.edns.OptionType.PADDING, dns.edns.OptionType.COOKIE],
+        )
+
+    def test_replace_options_absent_appends(self):
+        q = self.make_query_with_options()
+        q.replace_options(65002, [dns.edns.GenericOption(65002, b"\x07")])
+        self.assertEqual(q.options[-1].otype, 65002)
+        self.assertEqual(q.options[-1].data, b"\x07")
+        self.assertEqual(len(q.options), 5)
+
+    def test_replace_options_validation(self):
+        q = self.make_query_with_options()
+        with self.assertRaises(ValueError):
+            q.replace_options(self.private, [dns.edns.GenericOption(65002, b"\x07")])
+        with self.assertRaises(ValueError):
+            q.replace_options(self.private, [b"\x07"])
+
+    def test_replace_options_no_edns(self):
+        q = dns.message.make_query("example.com", "A")
+        wire = q.to_wire()
+        # Nothing to replace and no replacements is a no-op.
+        q.replace_options(self.private, [])
+        self.assertEqual(q.edns, -1)
+        self.assertEqual(q.to_wire(), wire)
+        # Replacements on a non-EDNS message enable EDNS0.
+        q.replace_options(self.private, [dns.edns.GenericOption(self.private, b"\x01")])
+        self.assertEqual(q.edns, 0)
+        self.assertEqual(len(q.options), 1)
+
+    def test_append_option(self):
+        q = self.make_query_with_options()
+        q.append_option(dns.edns.GenericOption(65002, b"\x08"))
+        self.assertEqual(q.options[-1].otype, 65002)
+        self.assertEqual(q.options[-1].data, b"\x08")
+        self.assertEqual(len(q.options), 5)
+        # The other options are undisturbed and in their original order.
+        self.assertEqual(
+            [o.otype for o in q.options[:4]],
+            [
+                self.private,
+                dns.edns.OptionType.PADDING,
+                dns.edns.OptionType.COOKIE,
+                self.private,
+            ],
+        )
+
+    def test_append_option_no_edns(self):
+        q = dns.message.make_query("example.com", "A")
+        q.append_option(dns.edns.GenericOption(self.private, b"\x01"))
+        self.assertEqual(q.edns, 0)
+        self.assertEqual(q.payload, dns.message.DEFAULT_EDNS_PAYLOAD)
+        self.assertEqual(len(q.options), 1)
+
+    def test_append_option_validation(self):
+        q = self.make_query_with_options()
+        with self.assertRaises(ValueError):
+            q.append_option(b"\x07")
+
+    def test_editing_preserves_ednsflags_and_payload(self):
+        q = self.make_query_with_options()
+        q.ednsflags |= dns.flags.DO
+        q.append_option(dns.edns.GenericOption(65002, b"\x08"))
+        self.assertEqual(q.ednsflags & dns.flags.DO, dns.flags.DO)
+        self.assertEqual(q.payload, 1232)
+        q.delete_options(self.private)
+        self.assertEqual(q.ednsflags & dns.flags.DO, dns.flags.DO)
+        self.assertEqual(q.payload, 1232)
+
+    def test_overlong_option(self):
+        q = dns.message.make_query("example.com", "A")
+        # Attaching an option whose data cannot fit in the 16-bit option
+        # length field raises TooBig.
+        with self.assertRaises(dns.exception.TooBig):
+            q.use_edns(
+                0, 0, 1232, options=[dns.edns.GenericOption(self.private, b"x" * 65536)]
+            )
+        # A large option that still fits in a message is fine.
+        q.use_edns(
+            0, 0, 1232, options=[dns.edns.GenericOption(self.private, b"x" * 1000)]
+        )
+        q2 = dns.message.from_wire(q.to_wire())
+        self.assertEqual(q2.options[0].data, b"x" * 1000)
+
+    def make_wire_with_bad_option(self, otype, olen, data):
+        q = dns.message.make_query("example.com", "A")
+        w = bytearray(q.to_wire())
+        # one additional record
+        w[10:12] = b"\x00\x01"
+        # OPT RR: root name, TYPE OPT, CLASS 1232, TTL 0
+        w += b"\x00\x00\x29\x04\xd0\x00\x00\x00\x00"
+        rdlength = 4 + len(data)
+        w += rdlength.to_bytes(2, "big")
+        w += otype.to_bytes(2, "big") + olen.to_bytes(2, "big") + data
+        return bytes(w)
+
+    def test_bad_option_length(self):
+        # The option length says 10 but only 2 octets are present.
+        w = self.make_wire_with_bad_option(self.private, 10, b"\x01\x02")
+        with self.assertRaises(dns.exception.FormError):
+            dns.message.from_wire(w)
+
+    def test_short_cookie_option(self):
+        # A cookie option needs at least 8 octets of client cookie.
+        w = self.make_wire_with_bad_option(dns.edns.OptionType.COOKIE, 4, b"1234")
+        with self.assertRaises(dns.exception.FormError):
+            dns.message.from_wire(w)
+
+    def test_bad_cookie_server_length(self):
+        # A server cookie must be empty or 8-32 octets; 4 is invalid.
+        w = self.make_wire_with_bad_option(
+            dns.edns.OptionType.COOKIE, 12, b"12345678srvr"
+        )
+        with self.assertRaises(dns.exception.FormError):
+            dns.message.from_wire(w)
+        with self.assertRaises(ValueError):
+            dns.edns.CookieOption(b"12345678", b"srvr")
+
+    def test_no_edns_message_unchanged(self):
+        q = dns.message.make_query("example.com", "A")
+        wire = q.to_wire()
+        q2 = dns.message.from_wire(wire)
+        self.assertEqual(q2.options, ())
+        self.assertEqual(q2.edns, -1)
+        self.assertEqual(q2.to_wire(), wire)
+
+    def test_tcp_style_round_trip(self):
+        q = self.make_query_with_options()
+        w = q.to_wire(prepend_length=True)
+        length = int.from_bytes(w[:2], "big")
+        q2 = dns.message.from_wire(w[2 : 2 + length])
+        self.assertEqual(q2.to_wire(), q.to_wire())
+
+    def test_tsig_signed_round_trip_preserves_options(self):
+        keyring = dns.tsigkeyring.from_text({"keyname.": "NjHwPsMKjdN++dOfE5iAiQ=="})
+        q = self.make_query_with_options()
+        q.use_tsig(keyring)
+        w = q.to_wire()
+        q2 = dns.message.from_wire(w, keyring=keyring)
+        self.assertIsNotNone(q2.tsig)
+        self.assertEqual(q2.options, q.options)
+        self.assertEqual(q2.to_wire(), w)
+
+
 if __name__ == "__main__":
     unittest.main()
