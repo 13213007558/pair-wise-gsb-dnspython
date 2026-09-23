@@ -18,3 +18,12 @@ The following constants may be used to specify sections in the
 .. autodata:: dns.update.PREREQ
 .. autodata:: dns.update.UPDATE
 .. autodata:: dns.update.ADDITIONAL
+
+Applying Updates to Zones
+---------------------------
+
+The :py:func:`dns.update.apply_update` function applies a dynamic update
+message to a zone, checking the prerequisites of the message and then
+applying its update section atomically, per RFC 2136.
+
+.. autofunction:: dns.update.apply_update
