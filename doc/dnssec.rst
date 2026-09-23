@@ -28,6 +28,17 @@ DNSSEC Functions
 .. autofunction:: dns.dnssec.default_rrset_signer()
 .. autofunction:: dns.dnssec.sign_zone()
 
+Authenticated Denial of Existence
+---------------------------------
+
+.. autofunction:: dns.nsec.validate_negative_response
+
+.. autoclass:: dns.nsec.NegativeProof
+   :members:
+
+.. autoclass:: dns.nsec.NegativeProofStatus
+   :members:
+
 DNSSEC Policy
 -------------
 
