@@ -9,3 +9,4 @@ DNS Zones
    zone-class
    zone-make
    inbound-xfr-class
+   zonemd

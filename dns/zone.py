@@ -74,6 +74,10 @@ class DigestVerificationFailure(dns.exception.DNSException):
     """The ZONEMD digest failed to verify."""
 
 
+class DigestBudgetExceeded(dns.exception.DNSException):
+    """The ZONEMD digest computation exceeded its size budget."""
+
+
 def _validate_name(
     name: dns.name.Name,
     origin: dns.name.Name | None,
@@ -835,6 +839,7 @@ class Zone(dns.transaction.TransactionManager):
         self,
         hash_algorithm: DigestHashAlgorithm,
         scheme: DigestScheme = DigestScheme.SIMPLE,
+        size_limit: int | None = None,
     ) -> bytes:
         hashinfo = _digest_hashers.get(hash_algorithm)
         if not hashinfo:
@@ -848,6 +853,7 @@ class Zone(dns.transaction.TransactionManager):
             assert self.origin is not None
             origin_name = self.origin
         hasher = hashinfo()
+        hashed = 0
         for name, node in sorted(self.items()):
             rrnamebuf = name.to_digestable(self.origin)
             for rdataset in sorted(node, key=lambda rds: (rds.rdtype, rds.covers)):
@@ -862,7 +868,11 @@ class Zone(dns.transaction.TransactionManager):
                 rdatas = [rdata.to_digestable(self.origin) for rdata in rdataset]
                 for rdata in sorted(rdatas):
                     rrlen = struct.pack("!H", len(rdata))
-                    hasher.update(rrnamebuf + rrfixed + rrlen + rdata)
+                    chunk = rrnamebuf + rrfixed + rrlen + rdata
+                    hashed += len(chunk)
+                    if size_limit is not None and hashed > size_limit:
+                        raise DigestBudgetExceeded
+                    hasher.update(chunk)
         return hasher.digest()
 
     def compute_digest(
