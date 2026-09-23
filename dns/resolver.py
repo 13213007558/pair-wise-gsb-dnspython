@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any, TextIO, cast
 from urllib.parse import urlparse
 
@@ -47,6 +47,7 @@ import dns.rdatatype
 import dns.rdtypes.ANY.PTR
 import dns.rdtypes.svcbbase
 import dns.reversename
+import dns.service
 import dns.tsig
 
 if sys.platform == "win32":  # pragma: no cover
@@ -1455,6 +1456,69 @@ class Resolver(BaseResolver):
         if not answers:
             raise NoAnswer(response=v6.response)
         return answers
+
+    def resolve_service(
+        self,
+        name: dns.name.Name | str,
+        alpn: Sequence[bytes | str] = (b"http/1.1",),
+        params: Iterable[int | str] = (),
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.HTTPS,
+        port: int | None = None,
+        max_aliases: int = 8,
+        lifetime: float | None = None,
+        search: bool | None = None,
+    ) -> list[dns.service.Endpoint]:
+        """Use a resolver to discover service endpoints as described in
+        RFC 9460.
+
+        Queries for an HTTPS (or SVCB) record, follows AliasMode chains,
+        filters ServiceMode records according to the caller's supported
+        ALPN protocols and SvcParamKeys, and resolves target addresses.
+        The result is a list of candidate endpoints, in preference order,
+        that the caller may connect to.  Only DNS queries are made; no
+        TCP, UDP, or TLS connections are attempted.
+
+        :param name: The service name, e.g. `_https._tcp.example.com.` or
+            simply `example.com.` for HTTPS service discovery.
+        :type name: :py:class:`dns.name.Name` or str
+        :param alpn: The ALPN protocol identifiers the caller supports,
+            e.g. `[b"h2", b"http/1.1"]`.  Records offering none of these
+            protocols are not usable.  The default is `(b"http/1.1",)`.
+        :type alpn: sequence of bytes or str
+        :param params: SvcParamKeys the caller supports, in addition to
+            those dnspython interprets itself (mandatory, alpn,
+            no-default-alpn, port, ipv4hint, and ipv6hint).  Keys may be
+            specified as text (e.g. `"ech"` or `"key65400"`) or as
+            integers.  Records with a mandatory parameter not in the
+            supported set are not usable; unknown optional parameters are
+            preserved in the endpoint's `params`.
+        :type params: iterable of int or str
+        :param rdtype: The service binding type to query,
+            `dns.rdatatype.HTTPS` (the default) or `dns.rdatatype.SVCB`.
+        :param port: The default port for endpoints whose record has no
+            `port` SvcParam, e.g. 443 for HTTPS.  If `None`, such
+            endpoints have a `port` of `None`.
+        :type port: int or None
+        :param max_aliases: The maximum number of AliasMode records to
+            follow before raising :py:exc:`dns.service.TooManyAliases`.
+        :type max_aliases: int
+        :param lifetime: How many seconds the whole discovery process may
+            run before timing out.
+        :type lifetime: float or None
+        :param search: Whether to use the search list for a relative
+            *name*.  `None` uses the resolver's `use_search_by_default`
+            setting.  Alias targets and address lookups never use the
+            search list.
+        :type search: bool or None
+        :raises dns.service.AliasLoop: If the AliasMode chain contains a
+            loop.
+        :raises dns.service.TooManyAliases: If the AliasMode chain exceeds
+            *max_aliases* hops.
+        :rtype: list of :py:class:`dns.service.Endpoint`
+        """
+        return dns.service._resolve_service_sync(
+            self, name, rdtype, alpn, params, port, max_aliases, lifetime, search
+        )
 
     # pylint: disable=redefined-outer-name
 

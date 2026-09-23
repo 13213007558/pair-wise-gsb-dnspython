@@ -19,6 +19,7 @@
 
 import socket
 import time
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import dns._ddr
@@ -32,6 +33,7 @@ import dns.rdataclass
 import dns.rdatatype
 import dns.resolver  # lgtm[py/import-and-import-from]
 import dns.reversename
+import dns.service
 
 # import some resolver symbols for brevity
 from dns.resolver import NXDOMAIN, NoAnswer, NoRootSOA, NotAbsolute
@@ -205,6 +207,45 @@ class Resolver(dns.resolver.BaseResolver):
         if not answers:
             raise NoAnswer(response=v6.response)
         return answers
+
+    async def resolve_service(
+        self,
+        name: dns.name.Name | str,
+        alpn: Sequence[bytes | str] = (b"http/1.1",),
+        params: Iterable[int | str] = (),
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.HTTPS,
+        port: int | None = None,
+        max_aliases: int = 8,
+        lifetime: float | None = None,
+        search: bool | None = None,
+        backend: dns.asyncbackend.Backend | None = None,
+    ) -> list[dns.service.Endpoint]:
+        """Use an asynchronous resolver to discover service endpoints as
+        described in RFC 9460.
+
+        This utilizes the resolve() method to perform SVCB/HTTPS and
+        address lookups.
+
+        :param backend: The async backend. If `None` (the default),
+            dnspython will use the default backend.
+        :type backend: :py:class:`dns.asyncbackend.Backend` or `None`
+
+        See :py:func:`dns.resolver.Resolver.resolve_service` for the
+        documentation of the other parameters, exceptions, and return
+        type of this method.
+        """
+        return await dns.service._resolve_service_async(
+            self,
+            name,
+            rdtype,
+            alpn,
+            params,
+            port,
+            max_aliases,
+            lifetime,
+            search,
+            backend,
+        )
 
     # pylint: disable=redefined-outer-name
 

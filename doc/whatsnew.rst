@@ -8,6 +8,13 @@ What's New in dnspython
 
 TBD
 
+* Added `dns.resolver.Resolver.resolve_service` and
+  `dns.asyncresolver.Resolver.resolve_service`, implementing RFC 9460
+  service discovery with SVCB and HTTPS records.  The methods follow AliasMode
+  chains, filter ServiceMode records by the caller's supported ALPN protocols
+  and SvcParamKeys, and return a list of `dns.service.Endpoint`
+  candidates with port, ALPN, target name, and source-tagged addresses.
+
 * DNSSEC now supports ML-DSA-44, a post-quantum signature algorithm.
 
 * A "transaction setup" callable may be specified when reading a zone from a file,

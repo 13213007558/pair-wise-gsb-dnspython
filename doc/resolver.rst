@@ -17,3 +17,4 @@ be used simply by setting the *nameservers* attribute.
    resolver-functions
    resolver-caching
    resolver-override
+   service
