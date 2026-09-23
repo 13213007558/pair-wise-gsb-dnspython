@@ -19,6 +19,7 @@
 
 import socket
 import time
+from collections.abc import Sequence
 from typing import Any
 
 import dns._ddr
@@ -30,8 +31,10 @@ import dns.nameserver
 import dns.query
 import dns.rdataclass
 import dns.rdatatype
+import dns.rdtypes.svcbbase
 import dns.resolver  # lgtm[py/import-and-import-from]
 import dns.reversename
+import dns.service
 
 # import some resolver symbols for brevity
 from dns.resolver import NXDOMAIN, NoAnswer, NoRootSOA, NotAbsolute
@@ -206,6 +209,135 @@ class Resolver(dns.resolver.BaseResolver):
             raise NoAnswer(response=v6.response)
         return answers
 
+    async def resolve_service(
+        self,
+        name: dns.name.Name | str,
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.HTTPS,
+        alpn: Sequence[str | bytes] | None = None,
+        supported_params: (
+            Sequence[dns.rdtypes.svcbbase.ParamKey | str | int] | None
+        ) = None,
+        default_alpn: str | bytes | None = None,
+        family: int = socket.AF_UNSPEC,
+        max_aliases: int = dns.service.DEFAULT_MAX_ALIASES,
+        resolve_addresses: bool = True,
+        **kwargs: Any,
+    ) -> list[dns.service.ServiceEndpoint]:
+        """Discover service endpoints using SVCB or HTTPS records (RFC 9460).
+
+        See :py:meth:`dns.resolver.Resolver.resolve_service` for the
+        documentation of the parameters, exceptions, and return type of
+        this method.
+
+        The *backend* keyword argument selects the async backend, as in
+        :py:meth:`dns.asyncresolver.Resolver.resolve`.
+        """
+        # We make a modified kwargs for type checking happiness, as otherwise
+        # we get a legit warning about possibly having rdtype and rdclass
+        # in the kwargs more than once.
+        modified_kwargs: dict[str, Any] = {}
+        modified_kwargs.update(kwargs)
+        modified_kwargs.pop("rdtype", None)
+        modified_kwargs["rdclass"] = dns.rdataclass.IN
+        modified_kwargs.pop("raise_on_no_answer", None)
+
+        rdtype, alpns, known_keys, default_alpn = dns.service._prepare(
+            rdtype, alpn, supported_params, default_alpn
+        )
+        if family not in (socket.AF_UNSPEC, socket.AF_INET, socket.AF_INET6):
+            raise NotImplementedError(f"unknown address family {family}")
+
+        lifetime = modified_kwargs.pop("lifetime", None)
+        start = time.time()
+
+        if isinstance(name, dns.name.Name):
+            qname: dns.name.Name | str = name
+        else:
+            qname = dns.name.from_text(name)
+        visited = {qname}
+        aliases = 0
+        while True:
+            answer = await self.resolve(
+                qname,
+                rdtype,
+                raise_on_no_answer=True,
+                lifetime=self._compute_timeout(start, lifetime),
+                **modified_kwargs,
+            )
+            rrset = answer.rrset
+            assert rrset is not None  # raise_on_no_answer is True
+            target = dns.service._alias_target(rrset)
+            if target is None:
+                break
+            if target == dns.name.root:
+                # An AliasMode TargetName of "." means the service does
+                # not exist (RFC 9460 section 2.5).
+                return []
+            if target in visited:
+                raise dns.service.AliasLoop(f"alias loop detected at {target}")
+            visited.add(target)
+            aliases += 1
+            if aliases > max_aliases:
+                raise dns.service.TooManyAliases(
+                    f"more than {max_aliases} aliases followed"
+                )
+            qname = target
+
+        owner = rrset.name
+        records = dns.service._select_records(rrset, alpns, known_keys, default_alpn)
+        endpoints: list[dns.service.ServiceEndpoint] = []
+        for rd, selected_alpns in records:
+            if rd.target == dns.name.root:
+                # A ServiceMode TargetName of "." means the owner name
+                # (RFC 9460 section 2.5).
+                target = owner
+            else:
+                target = rd.target
+            addresses: list[dns.service.ServiceAddress] = []
+            if resolve_addresses:
+                for addr_rdtype, addr_family in (
+                    (dns.rdatatype.AAAA, socket.AF_INET6),
+                    (dns.rdatatype.A, socket.AF_INET),
+                ):
+                    if family not in (socket.AF_UNSPEC, addr_family):
+                        continue
+                    try:
+                        addr_answer = await self.resolve(
+                            target,
+                            addr_rdtype,
+                            raise_on_no_answer=False,
+                            lifetime=self._compute_timeout(start, lifetime),
+                            **modified_kwargs,
+                        )
+                    except dns.exception.DNSException:
+                        # A failing address query for one target must not
+                        # make other usable records unavailable.
+                        continue
+                    if addr_answer.rrset is not None:
+                        for rdata in addr_answer.rrset:
+                            addresses.append(
+                                dns.service.ServiceAddress(
+                                    rdata.address,
+                                    addr_family,
+                                    dns.service.AddressSource.LOOKUP,
+                                )
+                            )
+            addresses.extend(dns.service._hint_addresses(rd, family))
+            port_param = rd.params.get(dns.rdtypes.svcbbase.ParamKey.PORT)
+            port = port_param.port if port_param is not None else None
+            endpoints.append(
+                dns.service.ServiceEndpoint(
+                    rd.priority,
+                    target,
+                    port,
+                    selected_alpns,
+                    rd.params,
+                    addresses,
+                    owner,
+                )
+            )
+        return endpoints
+
     # pylint: disable=redefined-outer-name
 
     async def canonical_name(self, name: dns.name.Name | str) -> dns.name.Name:
@@ -340,6 +472,18 @@ async def resolve_name(
     """
 
     return await get_default_resolver().resolve_name(name, family, **kwargs)
+
+
+async def resolve_service(
+    name: dns.name.Name | str, *args: Any, **kwargs: Any
+) -> list[dns.service.ServiceEndpoint]:
+    """Discover service endpoints using SVCB or HTTPS records (RFC 9460).
+
+    See :py:meth:`dns.asyncresolver.Resolver.resolve_service` for more
+    information on the parameters.
+    """
+
+    return await get_default_resolver().resolve_service(name, *args, **kwargs)
 
 
 async def canonical_name(name: dns.name.Name | str) -> dns.name.Name:

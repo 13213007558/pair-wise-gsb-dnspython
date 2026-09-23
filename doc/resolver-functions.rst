@@ -6,6 +6,7 @@ Resolver Functions and The Default Resolver
 .. autofunction:: dns.resolver.resolve
 .. autofunction:: dns.resolver.resolve_address
 .. autofunction:: dns.resolver.resolve_name
+.. autofunction:: dns.resolver.resolve_service
 .. autofunction:: dns.resolver.canonical_name
 .. autofunction:: dns.resolver.try_ddr
 .. autofunction:: dns.resolver.zone_for_name

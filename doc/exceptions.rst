@@ -78,6 +78,12 @@ dns.resolver Exceptions
 .. autoexception:: dns.resolver.NXDOMAIN
 .. autoexception:: dns.resolver.YXDOMAIN
 
+dns.service Exceptions
+----------------------
+
+.. autoexception:: dns.service.AliasLoop
+.. autoexception:: dns.service.TooManyAliases
+
 dns.tokenizer Exceptions
 ------------------------
 

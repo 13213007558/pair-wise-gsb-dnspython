@@ -15,5 +15,6 @@ be used simply by setting the *nameservers* attribute.
    resolver-class
    resolver-nameserver
    resolver-functions
+   service
    resolver-caching
    resolver-override

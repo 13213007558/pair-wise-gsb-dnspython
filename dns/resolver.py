@@ -47,6 +47,7 @@ import dns.rdatatype
 import dns.rdtypes.ANY.PTR
 import dns.rdtypes.svcbbase
 import dns.reversename
+import dns.service
 import dns.tsig
 
 if sys.platform == "win32":  # pragma: no cover
@@ -1456,6 +1457,179 @@ class Resolver(BaseResolver):
             raise NoAnswer(response=v6.response)
         return answers
 
+    def resolve_service(
+        self,
+        name: dns.name.Name | str,
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.HTTPS,
+        alpn: Sequence[str | bytes] | None = None,
+        supported_params: (
+            Sequence[dns.rdtypes.svcbbase.ParamKey | str | int] | None
+        ) = None,
+        default_alpn: str | bytes | None = None,
+        family: int = socket.AF_UNSPEC,
+        max_aliases: int = dns.service.DEFAULT_MAX_ALIASES,
+        resolve_addresses: bool = True,
+        **kwargs: Any,
+    ) -> list[dns.service.ServiceEndpoint]:
+        """Discover service endpoints using SVCB or HTTPS records (RFC 9460).
+
+        The service is looked up with a SVCB or HTTPS query for *name*.
+        AliasMode records are followed (at most *max_aliases* times), and
+        the usable ServiceMode records are returned as a list of
+        :py:class:`dns.service.ServiceEndpoint` candidates, in priority
+        order (lowest SvcPriority first).  Only the candidate endpoints
+        and their source information are returned; no TCP, TLS, or QUIC
+        connections are made.
+
+        :param name: The service name to look up.
+        :type name: :py:class:`dns.name.Name` or str
+        :param rdtype: ``SVCB`` or ``HTTPS`` (the default).
+        :type rdtype: :py:class:`dns.rdatatype.RdataType` or str or int
+        :param alpn: The ALPN protocol identifiers the caller supports,
+            e.g. ``[b"h2", b"h3"]``.  Records whose ``alpn``
+            parameter does not intersect this list are not usable.  If
+            ``None`` (the default), no ALPN filtering is done.
+        :type alpn: sequence of str or bytes, or ``None``
+        :param supported_params: SVCB parameter keys the caller supports
+            in addition to the ones dnspython implements.  Records whose
+            ``mandatory`` parameter requires an unknown key are not
+            usable; unknown optional parameters are preserved in the
+            endpoint's ``params``.
+        :type supported_params: sequence of ParamKey, str, or int, or ``None``
+        :param default_alpn: The ALPN identifier assumed for records
+            without an ``alpn`` parameter.  If ``None``, the
+            default is ``http/1.1`` for the HTTPS type and "no
+            filtering" for SVCB.
+        :type default_alpn: str or bytes or ``None``
+        :param family: The address family for target address lookups and
+            hints.  ``socket.AF_UNSPEC`` (the default) uses both
+            IPv4 and IPv6.
+        :type family: int
+        :param max_aliases: The maximum number of AliasMode records to
+            follow before raising :py:exc:`dns.service.TooManyAliases`.
+        :type max_aliases: int
+        :param resolve_addresses: If ``True`` (the default), query A
+            and/or AAAA records for each usable target and include the
+            results, labeled with source ``LOOKUP``, ahead of any
+            address hints.  A failing address query for one target does
+            not affect other records.  If ``False``, only address
+            hints are used.
+        :type resolve_addresses: bool
+        :raises dns.service.AliasLoop: If the AliasMode chain loops.
+        :raises dns.service.TooManyAliases: If the AliasMode chain is
+            longer than *max_aliases*.
+        :rtype: list of :py:class:`dns.service.ServiceEndpoint`
+
+        All other keyword arguments accepted by
+        :py:meth:`~dns.resolver.Resolver.resolve` (except *rdtype* and
+        *rdclass*) are also supported and are passed to each query made.
+        """
+        # We make a modified kwargs for type checking happiness, as otherwise
+        # we get a legit warning about possibly having rdtype and rdclass
+        # in the kwargs more than once.
+        modified_kwargs: dict[str, Any] = {}
+        modified_kwargs.update(kwargs)
+        modified_kwargs.pop("rdtype", None)
+        modified_kwargs["rdclass"] = dns.rdataclass.IN
+        modified_kwargs.pop("raise_on_no_answer", None)
+
+        rdtype, alpns, known_keys, default_alpn = dns.service._prepare(
+            rdtype, alpn, supported_params, default_alpn
+        )
+        if family not in (socket.AF_UNSPEC, socket.AF_INET, socket.AF_INET6):
+            raise NotImplementedError(f"unknown address family {family}")
+
+        lifetime = modified_kwargs.pop("lifetime", None)
+        start = time.time()
+
+        if isinstance(name, dns.name.Name):
+            qname: dns.name.Name | str = name
+        else:
+            qname = dns.name.from_text(name)
+        visited = {qname}
+        aliases = 0
+        while True:
+            answer = self.resolve(
+                qname,
+                rdtype,
+                raise_on_no_answer=True,
+                lifetime=self._compute_timeout(start, lifetime),
+                **modified_kwargs,
+            )
+            rrset = answer.rrset
+            assert rrset is not None  # raise_on_no_answer is True
+            target = dns.service._alias_target(rrset)
+            if target is None:
+                break
+            if target == dns.name.root:
+                # An AliasMode TargetName of "." means the service does
+                # not exist (RFC 9460 section 2.5).
+                return []
+            if target in visited:
+                raise dns.service.AliasLoop(f"alias loop detected at {target}")
+            visited.add(target)
+            aliases += 1
+            if aliases > max_aliases:
+                raise dns.service.TooManyAliases(
+                    f"more than {max_aliases} aliases followed"
+                )
+            qname = target
+
+        owner = rrset.name
+        records = dns.service._select_records(rrset, alpns, known_keys, default_alpn)
+        endpoints: list[dns.service.ServiceEndpoint] = []
+        for rd, selected_alpns in records:
+            if rd.target == dns.name.root:
+                # A ServiceMode TargetName of "." means the owner name
+                # (RFC 9460 section 2.5).
+                target = owner
+            else:
+                target = rd.target
+            addresses: list[dns.service.ServiceAddress] = []
+            if resolve_addresses:
+                for addr_rdtype, addr_family in (
+                    (dns.rdatatype.AAAA, socket.AF_INET6),
+                    (dns.rdatatype.A, socket.AF_INET),
+                ):
+                    if family not in (socket.AF_UNSPEC, addr_family):
+                        continue
+                    try:
+                        addr_answer = self.resolve(
+                            target,
+                            addr_rdtype,
+                            raise_on_no_answer=False,
+                            lifetime=self._compute_timeout(start, lifetime),
+                            **modified_kwargs,
+                        )
+                    except dns.exception.DNSException:
+                        # A failing address query for one target must not
+                        # make other usable records unavailable.
+                        continue
+                    if addr_answer.rrset is not None:
+                        for rdata in addr_answer.rrset:
+                            addresses.append(
+                                dns.service.ServiceAddress(
+                                    rdata.address,
+                                    addr_family,
+                                    dns.service.AddressSource.LOOKUP,
+                                )
+                            )
+            addresses.extend(dns.service._hint_addresses(rd, family))
+            port_param = rd.params.get(dns.rdtypes.svcbbase.ParamKey.PORT)
+            port = port_param.port if port_param is not None else None
+            endpoints.append(
+                dns.service.ServiceEndpoint(
+                    rd.priority,
+                    target,
+                    port,
+                    selected_alpns,
+                    rd.params,
+                    addresses,
+                    owner,
+                )
+            )
+        return endpoints
+
     # pylint: disable=redefined-outer-name
 
     def canonical_name(self, name: dns.name.Name | str) -> dns.name.Name:
@@ -1622,6 +1796,18 @@ def resolve_name(
     """
 
     return get_default_resolver().resolve_name(name, family, **kwargs)
+
+
+def resolve_service(
+    name: dns.name.Name | str, *args: Any, **kwargs: Any
+) -> list[dns.service.ServiceEndpoint]:
+    """Discover service endpoints using SVCB or HTTPS records (RFC 9460).
+
+    See :py:meth:`dns.resolver.Resolver.resolve_service` for more
+    information on the parameters.
+    """
+
+    return get_default_resolver().resolve_service(name, *args, **kwargs)
 
 
 def canonical_name(name: dns.name.Name | str) -> dns.name.Name:
