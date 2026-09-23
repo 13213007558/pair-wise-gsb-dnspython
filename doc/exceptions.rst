@@ -95,3 +95,13 @@ dns.zone Exceptions
 .. autoexception:: dns.zone.NoSOA
 .. autoexception:: dns.zone.NoNS
 .. autoexception:: dns.zone.UnknownOrigin
+.. autoexception:: dns.zone.UnsupportedDigestScheme
+.. autoexception:: dns.zone.UnsupportedDigestHashAlgorithm
+.. autoexception:: dns.zone.NoDigest
+.. autoexception:: dns.zone.DigestVerificationFailure
+
+dns.zonemd Exceptions
+---------------------
+
+.. autoexception:: dns.zonemd.DigestSerialMismatch
+.. autoexception:: dns.zonemd.DigestBudgetExceeded

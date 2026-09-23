@@ -8,6 +8,15 @@ What's New in dnspython
 
 TBD
 
+* The new ``dns.zonemd`` module provides ``compute_zonemd()`` and
+  ``verify_zonemd()``, a complete RFC 8976 ZONEMD entry point for zone
+  publishers and authoritative servers.  It supports scheme, hash algorithm,
+  and serial number selection, canonical ordering and exclusion rules,
+  per-record verification of multiple ZONEMD records with distinct
+  diagnostics for serial mismatches, unsupported algorithms, missing
+  origins, and digest failures, optional attachment of the computed RRset,
+  and a processing budget for streaming digestion of large zones.
+
 * DNSSEC now supports ML-DSA-44, a post-quantum signature algorithm.
 
 * A "transaction setup" callable may be specified when reading a zone from a file,

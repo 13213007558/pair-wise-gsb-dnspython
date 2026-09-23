@@ -20,7 +20,6 @@
 import dataclasses
 import io
 import os
-import struct
 from collections.abc import Callable, Iterable, Iterator, MutableMapping
 from typing import Any, BinaryIO, TextIO, cast
 
@@ -39,7 +38,7 @@ import dns.rrset
 import dns.tokenizer
 import dns.transaction
 import dns.zonefile
-from dns.zonetypes import DigestHashAlgorithm, DigestScheme, _digest_hashers
+from dns.zonetypes import DigestHashAlgorithm, DigestScheme
 
 
 class BadZone(dns.exception.DNSException):
@@ -836,34 +835,10 @@ class Zone(dns.transaction.TransactionManager):
         hash_algorithm: DigestHashAlgorithm,
         scheme: DigestScheme = DigestScheme.SIMPLE,
     ) -> bytes:
-        hashinfo = _digest_hashers.get(hash_algorithm)
-        if not hashinfo:
-            raise UnsupportedDigestHashAlgorithm
-        if scheme != DigestScheme.SIMPLE:
-            raise UnsupportedDigestScheme
+        # Imported here to avoid a circular import.
+        import dns.zonemd
 
-        if self.relativize:
-            origin_name = dns.name.empty
-        else:
-            assert self.origin is not None
-            origin_name = self.origin
-        hasher = hashinfo()
-        for name, node in sorted(self.items()):
-            rrnamebuf = name.to_digestable(self.origin)
-            for rdataset in sorted(node, key=lambda rds: (rds.rdtype, rds.covers)):
-                if name == origin_name and dns.rdatatype.ZONEMD in (
-                    rdataset.rdtype,
-                    rdataset.covers,
-                ):
-                    continue
-                rrfixed = struct.pack(
-                    "!HHI", rdataset.rdtype, rdataset.rdclass, rdataset.ttl
-                )
-                rdatas = [rdata.to_digestable(self.origin) for rdata in rdataset]
-                for rdata in sorted(rdatas):
-                    rrlen = struct.pack("!H", len(rdata))
-                    hasher.update(rrnamebuf + rrfixed + rrlen + rdata)
-        return hasher.digest()
+        return dns.zonemd._compute_digest(self, hash_algorithm, scheme)
 
     def compute_digest(
         self,
