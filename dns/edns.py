@@ -170,12 +170,22 @@ class GenericOption(Option):  # lgtm[py/missing-equals]
     """Generic Option Class
 
     This class is used for EDNS option types for which we have no better
-    implementation.
+    implementation.  It is also how unknown (e.g. private-use) option codes
+    are preserved when a message is read from wire format: the option code
+    and the raw, unparsed payload are kept verbatim so that the message can
+    be re-rendered byte-for-byte identically, and so that middleboxes can
+    inspect, delete, replace, or append options without understanding them.
+
+    The order of options within a message is significant to some devices;
+    options (including multiple options with the same code) are always kept
+    as an ordered sequence, never as a dictionary keyed by option code.
     """
 
     def __init__(self, otype: OptionType | str, data: bytes | str):
         super().__init__(otype)
         self.data = dns.rdata.Rdata._as_bytes(data, True)
+        if len(self.data) > 65535:
+            raise ValueError("EDNS option payload is too long (maximum is 65535)")
 
     def to_wire(self, file: Any | None = None) -> bytes | None:
         if file:

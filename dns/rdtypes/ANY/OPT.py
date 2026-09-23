@@ -56,6 +56,10 @@ class OPT(dns.rdata.Rdata):
     def _to_wire(self, file, compress=None, origin=None, canonicalize=False):
         for opt in self.options:
             owire = opt.to_wire()
+            if len(owire) > 65535:
+                raise dns.exception.FormError(
+                    "EDNS option payload is too long (maximum is 65535)"
+                )
             file.write(struct.pack("!HH", opt.otype, len(owire)))
             file.write(owire)
 
@@ -64,6 +68,10 @@ class OPT(dns.rdata.Rdata):
 
     @classmethod
     def from_wire_parser(cls, rdclass, rdtype, parser, origin=None):
+        # Options are kept as an ordered list so that unknown option codes
+        # (held as dns.edns.GenericOption), duplicate codes, and the relative
+        # order of options all survive a from_wire()/to_wire() round-trip
+        # byte-for-byte.
         options = []
         while parser.remaining() > 0:
             otype, olen = parser.get_struct("!HH")

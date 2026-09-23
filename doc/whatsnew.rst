@@ -49,6 +49,14 @@ TBD
   so the output did not parse back to the original value.  Such bytes are now
   escaped once, at the character-string level.
 
+* Unknown EDNS0 options (e.g. private-use option codes) are now preserved
+  verbatim -- option code, raw payload, and order of occurrence -- when a
+  message is read from wire format, so re-rendering an unmodified message
+  produces byte-identical output.  dns.message.Message now has
+  delete_options(), replace_options(), and append_options() helpers to edit
+  the EDNS0 option list; multiple options with the same option code are
+  supported and kept in order.
+
 * Rdata types with free-form string fields (URI, HINFO, X25, ISDN, NAPTR, and
   CAA) processed ``\ddd`` escapes as Unicode code points and then UTF-8 encoded
   them, so escapes greater than ``\127`` became two octets instead of one.  URI

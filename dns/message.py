@@ -22,7 +22,7 @@ import enum
 import io
 import os
 import time
-from typing import Any, TextIO, cast
+from typing import Any, Iterable, TextIO, cast
 
 import dns._file_util
 import dns.edns
@@ -909,6 +909,114 @@ class Message:
     def get_options(self, otype: dns.edns.OptionType) -> list[dns.edns.Option]:
         """Return the list of options of the specified type."""
         return [option for option in self.options if option.otype == otype]
+
+    def _set_options(self, options: Iterable[dns.edns.Option]) -> None:
+        """Replace the message's EDNS option list with *options*.
+
+        The OPT RR is rebuilt, preserving the EDNS level, flags, and payload
+        size.  The message must already have EDNS enabled.
+        """
+        if self.opt is None:
+            raise ValueError("the message does not use EDNS")
+        new_options = []
+        for option in options:
+            if not isinstance(option, dns.edns.Option):
+                raise ValueError("option is not a dns.edns.Option")
+            new_options.append(option)
+        opt_rdata = cast(dns.rdtypes.ANY.OPT.OPT, self.opt[0])
+        new_rdata = dns.rdtypes.ANY.OPT.OPT(
+            opt_rdata.rdclass, dns.rdatatype.OPT, tuple(new_options)
+        )
+        self.opt = dns.rrset.from_rdata(self.opt.name, self.opt.ttl, new_rdata)
+
+    @staticmethod
+    def _as_option_list(
+        options: dns.edns.Option | Iterable[dns.edns.Option],
+    ) -> list[dns.edns.Option]:
+        if isinstance(options, dns.edns.Option):
+            return [options]
+        return list(options)
+
+    def delete_options(self, otype: dns.edns.OptionType | str | int) -> int:
+        """Delete all EDNS options with the specified option code.
+
+        All occurrences are deleted; options with other codes are kept in
+        their original order.
+
+        :param otype: The option code to delete.
+        :type otype: :py:class:`dns.edns.OptionType` or ``str`` or ``int``
+        :rtype: ``int``, the number of options deleted.  If the message does
+            not use EDNS, there is nothing to delete and ``0`` is returned.
+        """
+        otype = dns.edns.OptionType.make(otype)
+        if self.opt is None:
+            return 0
+        kept = [option for option in self.options if option.otype != otype]
+        deleted = len(self.options) - len(kept)
+        if deleted:
+            self._set_options(kept)
+        return deleted
+
+    def replace_options(
+        self,
+        otype: dns.edns.OptionType | str | int,
+        options: dns.edns.Option | Iterable[dns.edns.Option],
+    ) -> None:
+        """Replace all EDNS options with the specified option code.
+
+        Every option in *options* must have option code *otype*.  If the
+        message already has options with this code, the replacements take
+        the position of the first existing occurrence and all other
+        occurrences are removed; otherwise the replacements are appended at
+        the end of the option list.  Passing an empty *options* is
+        equivalent to calling :py:meth:`delete_options`.
+
+        :param otype: The option code to replace.
+        :type otype: :py:class:`dns.edns.OptionType` or ``str`` or ``int``
+        :param options: The replacement option or options.
+        :type options: :py:class:`dns.edns.Option` or a sequence of
+            :py:class:`dns.edns.Option`
+        """
+        otype = dns.edns.OptionType.make(otype)
+        replacements = self._as_option_list(options)
+        for option in replacements:
+            if option.otype != otype:
+                raise ValueError(
+                    f"replacement option has code {option.otype}, expected {otype}"
+                )
+        if not replacements:
+            self.delete_options(otype)
+            return
+        current = list(self.options)
+        try:
+            first = next(i for i, o in enumerate(current) if o.otype == otype)
+        except StopIteration:
+            first = -1
+        if first < 0:
+            new_options = current + replacements
+        else:
+            new_options = (
+                [o for o in current[:first] if o.otype != otype]
+                + replacements
+                + [o for o in current[first:] if o.otype != otype]
+            )
+        self._set_options(new_options)
+
+    def append_options(
+        self, options: dns.edns.Option | Iterable[dns.edns.Option]
+    ) -> None:
+        """Append EDNS options at the end of the message's option list.
+
+        Options are appended in the order given, after all existing options,
+        including after any existing options with the same option codes.
+
+        :param options: The option or options to append.
+        :type options: :py:class:`dns.edns.Option` or a sequence of
+            :py:class:`dns.edns.Option`
+        """
+        additions = self._as_option_list(options)
+        if additions:
+            self._set_options(list(self.options) + additions)
 
     def extended_errors(self) -> list[dns.edns.EDEOption]:
         """Return the list of Extended DNS Error (EDE) options in the message"""
