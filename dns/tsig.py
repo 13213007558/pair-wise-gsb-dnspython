@@ -21,6 +21,7 @@ import base64
 import hashlib
 import hmac
 import struct
+import time
 
 import dns.exception
 import dns.name
@@ -30,7 +31,25 @@ import dns.rdatatype
 
 
 class BadTime(dns.exception.DNSException):
-    """The current time is not within the TSIG's validity time."""
+    """The current time is not within the TSIG's validity time.
+
+    The ``time_signed`` and ``now`` attributes allow the caller to
+    measure clock skew.  Note that a ``BadTime`` result is never a
+    successful validation, even though the MAC was verified.
+    """
+
+    supp_kwargs = {"time_signed", "now"}
+    fmt = "The current time is not within the TSIG's validity time."
+
+    @property
+    def time_signed(self) -> int | None:
+        """The time signed into the message, i.e. the peer's clock."""
+        return self.kwargs.get("time_signed")
+
+    @property
+    def now(self) -> int | None:
+        """The local time used when validating."""
+        return self.kwargs.get("now")
 
 
 class BadSignature(dns.exception.DNSException):
@@ -58,7 +77,19 @@ class PeerBadSignature(PeerError):
 
 
 class PeerBadTime(PeerError):
-    """The peer didn't like the time we sent"""
+    """The peer didn't like the time we sent.
+
+    The ``server_time`` attribute is the time the peer signed into its
+    BADTIME response, and may be used to calibrate the local clock.
+    """
+
+    supp_kwargs = {"server_time"}
+    fmt = "The peer didn't like the time we sent."
+
+    @property
+    def server_time(self) -> int | None:
+        """The server's time as signed into its BADTIME response."""
+        return self.kwargs.get("server_time")
 
 
 class PeerBadTruncation(PeerError):
@@ -298,7 +329,7 @@ def validate(
         elif rdata.error == dns.rcode.BADKEY:
             raise PeerBadKey
         elif rdata.error == dns.rcode.BADTIME:
-            raise PeerBadTime
+            raise PeerBadTime(server_time=rdata.time_signed)
         elif rdata.error == dns.rcode.BADTRUNC:
             raise PeerBadTruncation
         else:
@@ -310,7 +341,7 @@ def validate(
     ctx = _digest(new_wire, key, rdata, None, request_mac, ctx, multi)
     ctx.verify(rdata.mac)
     if abs(rdata.time_signed - now) > rdata.fudge:
-        raise BadTime
+        raise BadTime(time_signed=rdata.time_signed, now=now)
     return _maybe_start_digest(key, rdata.mac, multi)
 
 
@@ -333,6 +364,8 @@ class Key:
         name: dns.name.Name | str,
         secret: bytes | str,
         algorithm: dns.name.Name | str = default_algorithm,
+        not_before: int | None = None,
+        not_after: int | None = None,
     ):
         if isinstance(name, str):
             name = dns.name.from_text(name)
@@ -343,6 +376,20 @@ class Key:
         if isinstance(algorithm, str):
             algorithm = dns.name.from_text(algorithm)
         self.algorithm = algorithm
+        self.not_before = not_before
+        self.not_after = not_after
+
+    def valid_at(self, when: int) -> bool:
+        """Return ``True`` if the key is valid at the specified time.
+
+        The validity interval is [``not_before``, ``not_after``);
+        either bound may be ``None``, meaning unbounded.
+        """
+        if self.not_before is not None and when < self.not_before:
+            return False
+        if self.not_after is not None and when >= self.not_after:
+            return False
+        return True
 
     def __eq__(self, other):
         return (
@@ -358,3 +405,55 @@ class Key:
             r += f", secret='{base64.b64encode(self.secret).decode()}'"
         r += ">"
         return r
+
+
+class RotatingKeyring:
+    """A TSIG keyring for key rotation.
+
+    The keyring holds a ``current`` key and, optionally, a ``previous``
+    key, each with its own algorithm and validity interval (see
+    ``dns.tsig.Key``).  When validating a message, exactly one key is
+    selected, based on the message's TSIG time rather than the local
+    clock; there is deliberately no fallback to the other key if
+    verification fails, as that would allow a MAC made with one key to
+    be silently accepted under the other.  When signing, the key valid
+    at the current time is selected.
+    """
+
+    def __init__(self, current: Key, previous: Key | None = None):
+        self.current = current
+        self.previous = previous
+
+    def get_key(self, keyname: dns.name.Name, when: int) -> Key | None:
+        """Return the single key named ``keyname`` valid at ``when``.
+
+        Returns ``None`` if there is no such key.  The current key is
+        preferred if both keys are valid at ``when``.
+        """
+        for key in (self.current, self.previous):
+            if key is not None and key.name == keyname and key.valid_at(when):
+                return key
+        return None
+
+    def __call__(self, message, keyname):
+        # The callable keyring protocol, used when signing; the key
+        # valid "now" is selected.  (Validation selects by the message's
+        # TSIG time instead; see dns.message.)
+        if keyname is None:
+            keyname = self.current.name
+        return self.get_key(keyname, int(time.time()))
+
+    def __repr__(self):
+        # Note that we deliberately do not include any secret material.
+        def describe(key):
+            if key is None:
+                return "None"
+            return (
+                f"<DNS key name='{key.name}', algorithm='{key.algorithm}', "
+                f"not_before={key.not_before}, not_after={key.not_after}>"
+            )
+
+        return (
+            f"<DNS rotating keyring current={describe(self.current)}, "
+            f"previous={describe(self.previous)}>"
+        )

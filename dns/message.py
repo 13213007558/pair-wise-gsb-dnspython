@@ -684,8 +684,11 @@ class Message:
             :py:class:`dns.name.Name` keys to :py:class:`dns.tsig.Key` objects
             or ``bytes`` secrets. If a ``dict`` is given without *keyname*, the
             first key in the dict is used. A callable is invoked with the message
-            and *keyname* and must return a key.
-        :type keyring: dict, callable, or :py:class:`dns.tsig.Key`
+            and *keyname* and must return a key. A
+            :py:class:`dns.tsig.RotatingKeyring` signs with the key valid
+            at the current time.
+        :type keyring: dict, callable, :py:class:`dns.tsig.Key`, or
+            :py:class:`dns.tsig.RotatingKeyring`
         :param keyname: The TSIG key name. Ignored if *keyring* is a
             :py:class:`dns.tsig.Key`. Defaults to ``None``.
         :type keyname: :py:class:`dns.name.Name`, ``str``, or ``None``
@@ -1196,6 +1199,10 @@ class _WireReader:
                         key = self.keyring.get(absolute_name)
                         if isinstance(key, bytes):
                             key = dns.tsig.Key(absolute_name, key, trd.algorithm)
+                    elif isinstance(self.keyring, dns.tsig.RotatingKeyring):
+                        # Select exactly one key based on the message's
+                        # TSIG time, not the local clock.
+                        key = self.keyring.get_key(absolute_name, trd.time_signed)
                     elif callable(self.keyring):
                         key = self.keyring(self.message, absolute_name)
                     else:
@@ -1290,8 +1297,10 @@ def from_wire(
 
     :param keyring: The key or keyring for TSIG validation. ``None`` or
         ``True`` causes TSIG-signed messages to fail; ``False`` disables
-        validation.
-    :type keyring: :py:class:`dns.tsig.Key`, dict, bool, or ``None``
+        validation. A :py:class:`dns.tsig.RotatingKeyring` selects
+        exactly one key based on the message's TSIG time.
+    :type keyring: :py:class:`dns.tsig.Key`, dict, bool,
+        :py:class:`dns.tsig.RotatingKeyring`, or ``None``
     :param request_mac: MAC of the TSIG-signed request this message responds
         to, if any.
     :type request_mac: bytes or ``None``

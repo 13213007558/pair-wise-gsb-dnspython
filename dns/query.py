@@ -780,7 +780,7 @@ def receive_udp(
     expiration: float | None = None,
     ignore_unexpected: bool = False,
     one_rr_per_rrset: bool = False,
-    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | dns.tsig.RotatingKeyring | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
     raise_on_truncation: bool = False,
@@ -806,7 +806,7 @@ def receive_udp(
     :param one_rr_per_rrset: If ``True``, put each RR into its own RRset.
     :type one_rr_per_rrset: bool
     :param keyring: The keyring to use for TSIG.
-    :type keyring: dict or ``None``
+    :type keyring: dict, :py:class:`dns.tsig.RotatingKeyring`, or ``None``
     :param request_mac: The MAC of the request (for TSIG).
     :type request_mac: bytes or ``None``
     :param ignore_trailing: If ``True``, ignore trailing junk at end of the
@@ -1117,7 +1117,7 @@ def receive_tcp(
     sock: Any,
     expiration: float | None = None,
     one_rr_per_rrset: bool = False,
-    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | dns.tsig.RotatingKeyring | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
 ) -> tuple[dns.message.Message, float]:
@@ -1131,7 +1131,7 @@ def receive_tcp(
     :param one_rr_per_rrset: If ``True``, put each RR into its own RRset.
     :type one_rr_per_rrset: bool
     :param keyring: The keyring to use for TSIG.
-    :type keyring: dict or ``None``
+    :type keyring: dict, :py:class:`dns.tsig.RotatingKeyring`, or ``None``
     :param request_mac: The MAC of the request (for TSIG).
     :type request_mac: bytes or ``None``
     :param ignore_trailing: If ``True``, ignore trailing junk at end of the
@@ -1555,7 +1555,7 @@ def xfr(
     rdclass: dns.rdataclass.RdataClass | str = dns.rdataclass.IN,
     timeout: float | None = None,
     port: int = 53,
-    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | dns.tsig.RotatingKeyring | None = None,
     keyname: dns.name.Name | str | None = None,
     relativize: bool = True,
     lifetime: float | None = None,
@@ -1584,7 +1584,7 @@ def xfr(
     :param port: The port to send the message to.  Default is 53.
     :type port: int
     :param keyring: The keyring to use for TSIG.
-    :type keyring: dict or ``None``
+    :type keyring: dict, :py:class:`dns.tsig.RotatingKeyring`, or ``None``
     :param keyname: The name of the TSIG key to use.
     :type keyname: :py:class:`dns.name.Name` or str or ``None``
     :param relativize: If ``True``, relativize all names to the zone origin.

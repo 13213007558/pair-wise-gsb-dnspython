@@ -125,7 +125,7 @@ async def receive_udp(
     expiration: float | None = None,
     ignore_unexpected: bool = False,
     one_rr_per_rrset: bool = False,
-    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | dns.tsig.RotatingKeyring | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
     raise_on_truncation: bool = False,
@@ -359,7 +359,7 @@ async def receive_tcp(
     sock: dns.asyncbackend.StreamSocket,
     expiration: float | None = None,
     one_rr_per_rrset: bool = False,
-    keyring: dict[dns.name.Name, dns.tsig.Key] | None = None,
+    keyring: dict[dns.name.Name, dns.tsig.Key] | dns.tsig.RotatingKeyring | None = None,
     request_mac: bytes | None = b"",
     ignore_trailing: bool = False,
 ) -> tuple[dns.message.Message, float]:
