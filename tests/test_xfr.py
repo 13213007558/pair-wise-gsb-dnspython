@@ -633,6 +633,363 @@ keyring = dns.tsigkeyring.from_text({"keyname.": "NjHwPsMKjdN++dOfE5iAiQ=="})
 keyname = dns.name.from_text("keyname")
 
 
+def _outbound_zone():
+    """Make a versioned zone with committed versions at serials 1-4.
+
+    The versions and the final contents match the data of the classic
+    ixfr test above.
+    """
+    z = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    z.set_max_versions(None)
+    with z.writer() as txn:
+        txn.delete_exact(dns.rrset.from_text("bar.foo", 300, "in", "mx", "0 blaz.foo"))
+        txn.delete_exact(dns.rrset.from_text("ns2", 3600, "in", "a", "10.0.0.2"))
+        txn.add(dns.rrset.from_text("ns2", 3600, "in", "a", "10.0.0.4"))
+        txn.update_serial(2, relative=False)
+    with z.writer() as txn:
+        txn.add(dns.rrset.from_text("ns3", 3600, "in", "a", "10.0.0.3"))
+        txn.update_serial(3, relative=False)
+    with z.writer() as txn:
+        txn.delete_exact(dns.rrset.from_text("example.", 3600, "in", "ns", "ns2"))
+        txn.update_serial(4, relative=False)
+    return z
+
+
+def _apply_outbound(
+    query, messages, zone, serial=None, rdtype=dns.rdatatype.IXFR, keyring=None
+):
+    """Encode and decode each message, applying them to *zone* with Inbound."""
+    with dns.xfr.Inbound(zone, rdtype, serial) as inbound:
+        done = False
+        send_ctx = None
+        recv_ctx = None
+        for message in messages:
+            wire = message.to_wire(multi=True, tsig_ctx=send_ctx)
+            send_ctx = message.tsig_ctx
+            received = dns.message.from_wire(
+                wire,
+                keyring=keyring,
+                request_mac=query.mac,
+                xfr=True,
+                origin=zone.origin,
+                tsig_ctx=recv_ctx,
+                multi=True,
+                one_rr_per_rrset=True,
+            )
+            recv_ctx = received.tsig_ctx
+            done = inbound.process_message(received)
+        assert done
+
+
+def _dump_zone(zone):
+    """Dump a zone's contents, including TTLs, in a canonical form."""
+    return sorted(
+        (
+            str(name),
+            int(rds.rdtype),
+            rds.ttl,
+            tuple(sorted(str(rdata) for rdata in rds)),
+        )
+        for name, rds in zone.iterate_rdatasets()
+    )
+
+
+ttl_base = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+ns1 3600 IN A 10.0.0.1
+"""
+
+
+def test_outbound_basic_ixfr():
+    z = _outbound_zone()
+    before = z.to_text()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    with (
+        z.reader() as current,
+        z.reader(serial=1) as v1,
+        z.reader(serial=2) as v2,
+        z.reader(serial=3) as v3,
+    ):
+        messages = list(dns.xfr.Outbound(query, current, [v1, v2, v3]))
+    old = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    expected = dns.zone.from_text(ixfr_expected, "example.")
+    assert old == expected
+    assert old == z
+    # Generating the transfer did not alter the zone or its history.
+    assert z.to_text() == before
+
+
+def test_outbound_ixfr_multiple_messages():
+    z = dns.zone.from_text(ttl_base, "example.", zone_factory=dns.versioned.Zone)
+    z.set_max_versions(None)
+    with z.writer() as txn:
+        for i in range(60):
+            txn.add(
+                dns.rrset.from_text(f"h{i}", 3600, "in", "a", f"10.0.0.{i % 250 + 1}")
+            )
+        txn.update_serial(2, relative=False)
+    query, _ = dns.xfr.make_query(z, serial=1)
+    with z.reader() as current, z.reader(serial=1) as v1:
+        messages = list(dns.xfr.Outbound(query, current, [v1], max_size=512))
+    assert len(messages) > 1
+    for message in messages:
+        assert len(message.to_wire(multi=True)) <= 512
+    old = dns.zone.from_text(ttl_base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    assert old == z
+
+
+def test_outbound_ixfr_up_to_date():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=4)
+    with z.reader() as current:
+        messages = list(dns.xfr.Outbound(query, current))
+    assert len(messages) == 1
+    assert len(messages[0].answer) == 1
+    answer = messages[0].answer[0]
+    assert answer.rdtype == dns.rdatatype.SOA
+    assert answer[0].serial == 4
+    current_zone = dns.zone.from_text(
+        ixfr_expected, "example.", zone_factory=dns.versioned.Zone
+    )
+    _apply_outbound(query, messages, current_zone, serial=4)
+    assert current_zone == z
+
+
+def test_outbound_ixfr_client_ahead():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=5)
+    with z.reader() as current:
+        messages = list(dns.xfr.Outbound(query, current))
+    assert len(messages) == 1
+    assert len(messages[0].answer) == 1
+    answer = messages[0].answer[0]
+    assert answer.rdtype == dns.rdatatype.SOA
+    assert answer[0].serial == 4
+
+
+def test_outbound_undefined_serial_order():
+    z = _outbound_zone()
+    # 4 and 4 + 2**31 are exactly half of the serial number space apart.
+    query, _ = dns.xfr.make_query(z, serial=4 + 2**31)
+    with z.reader() as current:
+        with pytest.raises(dns.xfr.UndefinedSerialOrder):
+            dns.xfr.Outbound(query, current)
+
+
+wrap_base = """@ 3600 IN SOA foo bar 4294967293 2 3 4 5
+@ 3600 IN NS ns1
+ns1 3600 IN A 10.0.0.1
+"""
+
+wrap_expected = """@ 3600 IN SOA foo bar 1 2 3 4 5
+@ 3600 IN NS ns1
+ns1 3600 IN A 10.0.0.1
+w2 3600 IN A 10.0.0.2
+w3 3600 IN A 10.0.0.3
+w4 3600 IN A 10.0.0.4
+"""
+
+
+def test_outbound_ixfr_serial_wraparound():
+    z = dns.zone.from_text(wrap_base, "example.", zone_factory=dns.versioned.Zone)
+    z.set_max_versions(None)
+    for i, serial in enumerate((4294967294, 4294967295, 1)):
+        with z.writer() as txn:
+            txn.add(
+                dns.rrset.from_text(f"w{i + 2}", 3600, "in", "a", f"10.0.0.{i + 2}")
+            )
+            txn.update_serial(serial, relative=False)
+    query, _ = dns.xfr.make_query(z, serial=4294967293)
+    with (
+        z.reader() as current,
+        z.reader(serial=4294967293) as v1,
+        z.reader(serial=4294967294) as v2,
+        z.reader(serial=4294967295) as v3,
+    ):
+        messages = list(dns.xfr.Outbound(query, current, [v1, v2, v3]))
+    old = dns.zone.from_text(wrap_base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=4294967293)
+    expected = dns.zone.from_text(wrap_expected, "example.")
+    assert old == expected
+    assert old.get_soa().serial == 1
+
+
+def test_outbound_ixfr_ttl_only_change():
+    z = dns.zone.from_text(ttl_base, "example.", zone_factory=dns.versioned.Zone)
+    z.set_max_versions(None)
+    with z.writer() as txn:
+        txn.replace(dns.rrset.from_text("ns1", 7200, "in", "a", "10.0.0.1"))
+        txn.update_serial(2, relative=False)
+    query, _ = dns.xfr.make_query(z, serial=1)
+    with z.reader() as current, z.reader(serial=1) as v1:
+        messages = list(dns.xfr.Outbound(query, current, [v1]))
+    # The sequence is SOA2, SOA1, delete A, SOA2, add A, SOA2.
+    answers = [rrset for message in messages for rrset in message.answer]
+    assert len(answers) == 6
+    old = dns.zone.from_text(ttl_base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    rdataset = old.get_rdataset("ns1", "a")
+    assert rdataset is not None
+    assert rdataset.ttl == 7200
+    assert _dump_zone(old) == _dump_zone(z)
+
+
+def test_outbound_ixfr_history_pruned_fallback():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    # The history starts at version 2; version 1 has been pruned.
+    with z.reader() as current, z.reader(serial=2) as v2, z.reader(serial=3) as v3:
+        messages = list(
+            dns.xfr.Outbound(query, current, [v2, v3], fallback_to_axfr=True)
+        )
+    old = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    assert old == z
+
+
+def test_outbound_ixfr_empty_history_fallback():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    with z.reader() as current:
+        messages = list(dns.xfr.Outbound(query, current, fallback_to_axfr=True))
+    old = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    assert old == z
+
+
+def test_outbound_ixfr_history_unavailable():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    # The client's version is not in the history.
+    with z.reader() as current, z.reader(serial=2) as v2, z.reader(serial=3) as v3:
+        with pytest.raises(dns.xfr.IXFRHistoryUnavailable):
+            dns.xfr.Outbound(query, current, [v2, v3])
+    # There is no history at all.
+    with z.reader() as current:
+        with pytest.raises(dns.xfr.IXFRHistoryUnavailable):
+            dns.xfr.Outbound(query, current)
+    # The history is not consecutive (serials go backwards).
+    query2, _ = dns.xfr.make_query(z, serial=2)
+    with z.reader() as current, z.reader(serial=2) as v2, z.reader(serial=1) as v1:
+        with pytest.raises(dns.xfr.IXFRHistoryUnavailable):
+            dns.xfr.Outbound(query2, current, [v2, v1])
+
+
+def test_outbound_axfr():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=None)
+    with z.reader() as current:
+        messages = list(dns.xfr.Outbound(query, current))
+    new = dns.versioned.Zone("example.")
+    _apply_outbound(query, messages, new, rdtype=dns.rdatatype.AXFR)
+    assert new == z
+
+
+def test_outbound_ixfr_tsig():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1, keyring=keyring, keyname=keyname)
+    query.to_wire()  # realize the query MAC, as a real server would have it
+    with (
+        z.reader() as current,
+        z.reader(serial=1) as v1,
+        z.reader(serial=2) as v2,
+        z.reader(serial=3) as v3,
+    ):
+        messages = list(dns.xfr.Outbound(query, current, [v1, v2, v3], max_size=512))
+    assert len(messages) > 1
+    for message in messages:
+        assert message.had_tsig
+        assert len(message.to_wire(multi=True)) <= 512
+    old = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1, keyring=keyring)
+    assert old == z
+
+
+def test_outbound_record_too_big():
+    z = dns.zone.from_text(ttl_base, "example.", zone_factory=dns.versioned.Zone)
+    z.set_max_versions(None)
+    big = " ".join('"' + "x" * 200 + '"' for _ in range(4))
+    with z.writer() as txn:
+        txn.add(dns.rrset.from_text("big", 3600, "in", "txt", big))
+        txn.update_serial(2, relative=False)
+    query, _ = dns.xfr.make_query(z, serial=1)
+    with z.reader() as current, z.reader(serial=1) as v1:
+        outbound = dns.xfr.Outbound(query, current, [v1], max_size=512)
+        with pytest.raises(dns.exception.TooBig):
+            list(outbound)
+
+
+def test_outbound_bad_query():
+    z = _outbound_zone()
+    q = dns.message.make_query("example.", "a")
+    with z.reader() as current:
+        with pytest.raises(ValueError):
+            dns.xfr.Outbound(q, current)
+    # no question section
+    q, _ = dns.xfr.make_query(z, serial=1)
+    q.question = []
+    with z.reader() as current:
+        with pytest.raises(ValueError):
+            dns.xfr.Outbound(q, current)
+
+
+def test_outbound_wrong_origin():
+    z = _outbound_zone()
+    other = dns.versioned.Zone("other.")
+    query, _ = dns.xfr.make_query(other, serial=1)
+    with z.reader() as current:
+        with pytest.raises(ValueError):
+            dns.xfr.Outbound(query, current)
+
+
+v2_text = """@ 3600 IN SOA foo bar 2 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+ns1 3600 IN A 10.0.0.1
+ns2 3600 IN A 10.0.0.4
+"""
+
+v3_text = """@ 3600 IN SOA foo bar 3 2 3 4 5
+@ 3600 IN NS ns1
+@ 3600 IN NS ns2
+ns1 3600 IN A 10.0.0.1
+ns2 3600 IN A 10.0.0.4
+ns3 3600 IN A 10.0.0.3
+"""
+
+
+def test_outbound_zone_sources():
+    # The current zone and the history may be plain zones, not just
+    # transactions.
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    history = [
+        dns.zone.from_text(t, "example.", relativize=False)
+        for t in (base, v2_text, v3_text)
+    ]
+    messages = list(dns.xfr.Outbound(query, z, history))
+    old = dns.zone.from_text(base, "example.", zone_factory=dns.versioned.Zone)
+    _apply_outbound(query, messages, old, serial=1)
+    assert old == z
+
+
+def test_outbound_bad_zone_sources():
+    z = _outbound_zone()
+    query, _ = dns.xfr.make_query(z, serial=1)
+    # the current zone has no SOA
+    with pytest.raises(ValueError):
+        dns.xfr.Outbound(query, dns.zone.Zone("example."))
+    # the current zone has no origin
+    with pytest.raises(ValueError):
+        dns.xfr.Outbound(query, dns.zone.Zone(None))
+    # a history version has a different origin
+    other = dns.zone.from_text(base, "other.")
+    with pytest.raises(ValueError):
+        dns.xfr.Outbound(query, z, [other])
+
+
 def test_make_query_basic():
     z = dns.versioned.Zone("example.")
     q, s = dns.xfr.make_query(z)

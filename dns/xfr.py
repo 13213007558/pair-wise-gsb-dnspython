@@ -15,11 +15,12 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT
 # OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
-from collections.abc import Callable
-from typing import Any, cast
+from collections.abc import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, cast
 
 import dns.edns
 import dns.exception
+import dns.flags
 import dns.message
 import dns.name
 import dns.rcode
@@ -29,9 +30,13 @@ import dns.rdatatype
 import dns.rdtypes
 import dns.rdtypes.ANY
 import dns.rdtypes.ANY.SOA
+import dns.rrset
 import dns.serial
 import dns.transaction
 import dns.tsig
+
+if TYPE_CHECKING:
+    import dns.zone
 
 
 class TransferError(dns.exception.DNSException):
@@ -377,3 +382,299 @@ def extract_serial_from_query(query: dns.message.Message) -> int | None:
     )
     soa = cast(dns.rdtypes.ANY.SOA.SOA, soa_rrset[0])
     return soa.serial
+
+
+class UndefinedSerialOrder(dns.exception.DNSException):
+    """The order of two serial numbers is undefined (RFC 1982)."""
+
+
+class IXFRHistoryUnavailable(dns.exception.DNSException):
+    """The history needed to generate an IXFR is not available."""
+
+
+# A snapshot of the contents of a zone (or zone version), mapping
+# absolute owner names to a map of (rdtype, covers) to rdataset.
+_SnapshotKey = tuple[dns.rdatatype.RdataType, dns.rdatatype.RdataType]
+_Snapshot = dict[dns.name.Name, dict[_SnapshotKey, dns.rdataset.Rdataset]]
+
+_SOA_KEY: _SnapshotKey = (dns.rdatatype.SOA, dns.rdatatype.NONE)
+
+
+def _snapshot_zone(
+    source: "dns.transaction.Transaction | dns.zone.Zone",
+) -> tuple[dns.name.Name, _Snapshot]:
+    """Read *source*, which may be a transaction or a zone, into a
+    snapshot of its contents, returning an (origin, snapshot) tuple.
+
+    The source is only read, never modified.
+    """
+    if isinstance(source, dns.transaction.Transaction):
+        manager = source.manager
+    else:
+        manager = source
+    origin, _, _ = manager.origin_information()
+    if origin is None:
+        raise ValueError("zone source does not have an origin")
+    snapshot: _Snapshot = {}
+    for name, rdataset in source.iterate_rdatasets():
+        if not name.is_absolute():
+            name = name.derelativize(origin)
+        key = (rdataset.rdtype, rdataset.covers)
+        snapshot.setdefault(name, {})[key] = rdataset
+    return (origin, snapshot)
+
+
+def _snapshot_soa(origin: dns.name.Name, snapshot: _Snapshot) -> dns.rdataset.Rdataset:
+    """Get the SOA rdataset from a snapshot."""
+    node = snapshot.get(origin)
+    if node is not None:
+        rdataset = node.get(_SOA_KEY)
+        if rdataset is not None:
+            return rdataset
+    raise ValueError("zone source has no SOA at the origin")
+
+
+def _diff_snapshots(origin: dns.name.Name, old: _Snapshot, new: _Snapshot) -> tuple[
+    list[tuple[dns.name.Name, dns.rdataset.Rdataset]],
+    list[tuple[dns.name.Name, dns.rdataset.Rdataset]],
+]:
+    """Compute the deletions and additions that transform *old* into *new*.
+
+    The SOA rdataset at the origin is excluded, as it is conveyed by the
+    IXFR sequence boundaries.  TTL-only changes are treated as changes.
+    """
+    deletions: list[tuple[dns.name.Name, dns.rdataset.Rdataset]] = []
+    additions: list[tuple[dns.name.Name, dns.rdataset.Rdataset]] = []
+    for name in sorted(set(old) | set(new)):
+        old_node = old.get(name, {})
+        new_node = new.get(name, {})
+        for key in sorted(old_node):
+            if name == origin and key == _SOA_KEY:
+                continue
+            old_rdataset = old_node[key]
+            new_rdataset = new_node.get(key)
+            if new_rdataset is None:
+                deletions.append((name, old_rdataset))
+            elif old_rdataset != new_rdataset or old_rdataset.ttl != new_rdataset.ttl:
+                deletions.append((name, old_rdataset))
+                additions.append((name, new_rdataset))
+        for key in sorted(new_node):
+            if name == origin and key == _SOA_KEY:
+                continue
+            if key not in old_node:
+                additions.append((name, new_node[key]))
+    return (deletions, additions)
+
+
+class Outbound:
+    """Generator for outbound zone transfers.
+
+    This is the server side of a zone transfer: given the client's query,
+    the current contents of the zone, and (for IXFRs) the consecutive
+    historical versions of the zone reaching back to the client's version,
+    iterating over it yields the sequence of response messages to send to
+    the client.  The messages are ready to be encoded with
+    :py:meth:`dns.message.Message.to_wire`.
+    """
+
+    def __init__(
+        self,
+        query: dns.message.QueryMessage,
+        current: "dns.transaction.Transaction | dns.zone.Zone",
+        history: Sequence["dns.transaction.Transaction | dns.zone.Zone"] = (),
+        *,
+        fallback_to_axfr: bool = False,
+        max_size: int = 65535,
+    ):
+        """Initialize an outbound zone transfer.
+
+        :param query: The client's AXFR or IXFR query.  For an IXFR, the
+            client's SOA serial number is extracted from the query's
+            authority section.
+        :type query: dns.message.QueryMessage
+        :param current: The current contents of the zone, either a
+            :py:class:`dns.transaction.Transaction` or a
+            :py:class:`dns.zone.Zone`.  It is only read, never modified.
+        :param history: The consecutive historical versions of the zone,
+            oldest first, needed to serve an IXFR.  The first version must
+            be the version the client has, i.e. its SOA serial must be the
+            serial from the query, and the versions must have strictly
+            increasing serial numbers (in the RFC 1982 sense) leading up to
+            the current version.  Each version is only read, never modified.
+        :param fallback_to_axfr: If True, respond with an AXFR-style full
+            transfer when the history needed for an IXFR is not available
+            (e.g. it has been pruned or is not consecutive).  If False,
+            raise :py:exc:`dns.xfr.IXFRHistoryUnavailable` instead.
+        :type fallback_to_axfr: bool
+        :param max_size: The maximum wire format size of any generated
+            message.  Compression, EDNS, and TSIG (including continuous
+            signing of a multi-message transfer) are all accounted for when
+            packing messages.  If a single record does not fit, iterating
+            raises :py:exc:`dns.exception.TooBig`.
+        :type max_size: int
+
+        Iterating over the outbound transfer yields
+        :py:class:`dns.message.Message` objects.  Packetization never
+        changes the order of the update records.  When encoding the
+        messages, the TSIG context should be chained, e.g.::
+
+            tsig_ctx = None
+            for message in outbound:
+                wire = message.to_wire(multi=True, tsig_ctx=tsig_ctx)
+                tsig_ctx = message.tsig_ctx
+                ...  # send wire
+
+        :raises dns.xfr.UndefinedSerialOrder: If the client's serial and the
+            current serial differ by exactly half of the serial number
+            space, so that their order is undefined (RFC 1982).
+        :raises dns.xfr.IXFRHistoryUnavailable: If the history needed for
+            the IXFR is not available and *fallback_to_axfr* is False.
+        :raises ValueError: If the query is not an AXFR or IXFR query, if
+            its question name is not the zone origin, or if a zone source
+            has no origin or SOA.
+        """
+        if len(query.question) == 0:
+            raise ValueError("query has no question section")
+        serial = extract_serial_from_query(query)
+        self.query = query
+        self.max_size = max_size
+        self.origin, current_snapshot = _snapshot_zone(current)
+        if query.question[0].name != self.origin:
+            raise ValueError("query question name is not the zone origin")
+        self.current_soa = _snapshot_soa(self.origin, current_snapshot)
+        self._items: list[tuple[dns.name.Name, dns.rdataset.Rdataset]] = []
+        if serial is None:
+            self._make_axfr(current_snapshot)
+        else:
+            self._make_ixfr(serial, current_snapshot, history, fallback_to_axfr)
+
+    def _make_axfr(self, current_snapshot: _Snapshot) -> None:
+        """Build a full zone transfer sequence."""
+        items = self._items
+        items.append((self.origin, self.current_soa))
+        for name in sorted(current_snapshot):
+            node = current_snapshot[name]
+            for key in sorted(node):
+                if name == self.origin and key == _SOA_KEY:
+                    continue
+                items.append((name, node[key]))
+        items.append((self.origin, self.current_soa))
+
+    def _make_ixfr(
+        self,
+        serial: int,
+        current_snapshot: _Snapshot,
+        history: Sequence["dns.transaction.Transaction | dns.zone.Zone"],
+        fallback_to_axfr: bool,
+    ) -> None:
+        """Build an incremental transfer sequence per RFC 1995."""
+        current_serial = cast(dns.rdtypes.ANY.SOA.SOA, self.current_soa[0]).serial
+        client_serial = dns.serial.Serial(serial)
+        if client_serial == current_serial or client_serial > current_serial:
+            #
+            # The client is already up-to-date (or is ahead of us, in
+            # which case we have nothing useful to send either), so we
+            # respond with just the current SOA.
+            #
+            self._items.append((self.origin, self.current_soa))
+            return
+        if not client_serial < current_serial:
+            #
+            # The serials differ but neither is less than the other, so
+            # they are exactly half of the serial number space apart and
+            # their order is undefined (RFC 1982).
+            #
+            raise UndefinedSerialOrder(
+                f"cannot determine the order of serials {serial} "
+                f"and {current_serial}"
+            )
+        #
+        # Snapshot the history and check that it is a consecutive chain of
+        # versions from the client's serial to the current serial.
+        #
+        versions: list[tuple[dns.rdataset.Rdataset, _Snapshot]] = []
+        for source in history:
+            origin, snapshot = _snapshot_zone(source)
+            if origin != self.origin:
+                raise ValueError("history version has a different origin")
+            versions.append((_snapshot_soa(origin, snapshot), snapshot))
+        versions.append((self.current_soa, current_snapshot))
+        usable = len(versions) >= 2 and self._serial(versions[0][0]) == serial
+        if usable:
+            for i in range(len(versions) - 1):
+                if not self._serial(versions[i][0]) < self._serial(versions[i + 1][0]):
+                    usable = False
+                    break
+        if not usable:
+            if not fallback_to_axfr:
+                raise IXFRHistoryUnavailable(
+                    f"no consecutive version history from serial {serial} "
+                    f"to {current_serial}"
+                )
+            self._make_axfr(current_snapshot)
+            return
+        #
+        # Emit the RFC 1995 sequence: the current SOA, then for each
+        # version step the old SOA, the deletions, the new SOA, and the
+        # additions, and finally the current SOA again as the end marker.
+        #
+        items = self._items
+        items.append((self.origin, self.current_soa))
+        for i in range(len(versions) - 1):
+            old_soa, old_snapshot = versions[i]
+            new_soa, new_snapshot = versions[i + 1]
+            deletions, additions = _diff_snapshots(
+                self.origin, old_snapshot, new_snapshot
+            )
+            items.append((self.origin, old_soa))
+            items.extend(deletions)
+            items.append((self.origin, new_soa))
+            items.extend(additions)
+        items.append((self.origin, self.current_soa))
+
+    @staticmethod
+    def _serial(soa: dns.rdataset.Rdataset) -> dns.serial.Serial:
+        return dns.serial.Serial(cast(dns.rdtypes.ANY.SOA.SOA, soa[0]).serial)
+
+    def _make_message(self, first: bool) -> dns.message.Message:
+        """Make a response message skeleton."""
+        if first:
+            response = dns.message.make_response(self.query)
+        else:
+            response = dns.message.make_response(
+                self.query, copy_mode=dns.message.CopyMode.NOTHING
+            )
+        response.flags |= dns.flags.AA
+        response.origin = self.origin
+        return response
+
+    def __iter__(self) -> Iterator[dns.message.Message]:
+        """Generate the response messages for the transfer."""
+        tsig_ctx = None
+        message = self._make_message(True)
+        answers = 0
+        for name, rdataset in self._items:
+            rrset = dns.rrset.RRset(
+                name, rdataset.rdclass, rdataset.rdtype, rdataset.covers
+            )
+            rrset.update(rdataset)
+            while True:
+                message.answer.append(rrset)
+                try:
+                    message.to_wire(
+                        max_size=self.max_size, multi=True, tsig_ctx=tsig_ctx
+                    )
+                except dns.exception.TooBig:
+                    message.answer.pop()
+                    if answers == 0:
+                        # A single record doesn't fit in a message.
+                        raise
+                    tsig_ctx = message.tsig_ctx
+                    yield message
+                    message = self._make_message(False)
+                    answers = 0
+                    continue
+                answers += 1
+                break
+        if answers > 0:
+            yield message

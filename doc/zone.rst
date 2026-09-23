@@ -6,6 +6,7 @@ DNS Zones
 
 .. toctree::
 
-   zone-class
-   zone-make
-   inbound-xfr-class
+  zone-class
+  zone-make
+  inbound-xfr-class
+   outbound-xfr-class
