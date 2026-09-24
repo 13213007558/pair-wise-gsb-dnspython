@@ -45,6 +45,7 @@ import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
 import dns.rdtypes.ANY.PTR
+import dns.rdtypes.ANY.SOA
 import dns.rdtypes.svcbbase
 import dns.reversename
 import dns.tsig
@@ -161,6 +162,37 @@ def _errors_to_text(errors: list[ErrorTuple]) -> list[str]:
     for err in errors:
         texts.append(f"Server {err[0]} answered {err[3]}")
     return texts
+
+
+def _soa_negative_ttl(
+    response: dns.message.Message,
+    qname: dns.name.Name,
+    rdclass: dns.rdataclass.RdataClass,
+) -> int | None:
+    """Return the negative caching TTL for *response*, or ``None``.
+
+    The negative caching TTL (RFC 2308) is the minimum of the applicable
+    SOA RRset's TTL and the SOA's MINIMUM field.  The applicable SOA is
+    the one in the authority section whose owner name is the closest
+    enclosing superdomain of *qname*, which is usually the canonical
+    name after CNAME/DNAME chaining.  If no applicable SOA is present,
+    then the response must not be negatively cached, and ``None`` is
+    returned.
+    """
+
+    name = qname
+    while True:
+        try:
+            srrset = response.find_rrset(
+                response.authority, name, rdclass, dns.rdatatype.SOA
+            )
+            srdata = cast(dns.rdtypes.ANY.SOA.SOA, srrset[0])
+            return min(srrset.ttl, srdata.minimum)
+        except KeyError:
+            try:
+                name = name.parent()
+            except dns.name.NoParent:
+                return None
 
 
 class LifetimeTimeout(dns.exception.Timeout):
@@ -466,7 +498,13 @@ class Cache(CacheBase):
         with self.lock:
             self._maybe_clean()
             v = self.data.get(key)
-            if v is None or v.expiration <= time.time():
+            if v is None:
+                self.statistics.misses += 1
+                return None
+            if v.expiration <= time.time():
+                # Expired; remove it so no stale partial entry is left
+                # behind.
+                del self.data[key]
                 self.statistics.misses += 1
                 return None
             self.statistics.hits += 1
@@ -711,6 +749,11 @@ class _Resolution:
                         raise NoAnswer(response=answer.response)
                     else:
                         return (None, answer)
+                # NXDOMAINs are cached by qname only, using ANY as the
+                # rdtype in the key, as a name that does not exist does
+                # not exist for any qtype.  NODATA responses, in contrast,
+                # are cached by (qname, qtype, qclass).  The keys cannot
+                # collide as ANY is a metatype and cannot be queried.
                 answer = self.resolver.cache.get(
                     (self.qname, dns.rdatatype.ANY, self.rdclass)
                 )
@@ -844,7 +887,24 @@ class _Resolution:
                 self.nameservers.remove(self.nameserver)
                 return (None, False)
             if self.resolver.cache:
-                self.resolver.cache.put((self.qname, self.rdtype, self.rdclass), answer)
+                if answer.rrset is not None:
+                    self.resolver.cache.put(
+                        (self.qname, self.rdtype, self.rdclass), answer
+                    )
+                else:
+                    # NODATA; negatively cache it by (qname, qtype, qclass)
+                    # using the SOA negative TTL.  If there is no
+                    # applicable SOA, do not cache it at all.
+                    negative_ttl = _soa_negative_ttl(
+                        response,
+                        answer.chaining_result.canonical_name,
+                        self.rdclass,
+                    )
+                    if negative_ttl is not None:
+                        answer.expiration = time.time() + negative_ttl
+                        self.resolver.cache.put(
+                            (self.qname, self.rdtype, self.rdclass), answer
+                        )
             if answer.rrset is None and self.raise_on_no_answer:
                 raise NoAnswer(response=answer.response)
             return (answer, True)
@@ -852,9 +912,7 @@ class _Resolution:
             # Further validate the response by making an Answer, even
             # if we aren't going to cache it.
             try:
-                answer = Answer(
-                    self.qname, dns.rdatatype.ANY, dns.rdataclass.IN, response
-                )
+                answer = Answer(self.qname, dns.rdatatype.ANY, self.rdclass, response)
             except Exception as e:
                 self.errors.append(
                     (
@@ -870,9 +928,19 @@ class _Resolution:
                 return (None, False)
             self.nxdomain_responses[self.qname] = response
             if self.resolver.cache:
-                self.resolver.cache.put(
-                    (self.qname, dns.rdatatype.ANY, self.rdclass), answer
+                # Negatively cache the NXDOMAIN by qname (using ANY as the
+                # key's rdtype) with the SOA negative TTL.  If there is no
+                # applicable SOA, do not cache it at all.
+                negative_ttl = _soa_negative_ttl(
+                    response,
+                    answer.chaining_result.canonical_name,
+                    self.rdclass,
                 )
+                if negative_ttl is not None:
+                    answer.expiration = time.time() + negative_ttl
+                    self.resolver.cache.put(
+                        (self.qname, dns.rdatatype.ANY, self.rdclass), answer
+                    )
             # Make next_nameserver() return None, so caller breaks its
             # inner loop and calls next_request().
             return (None, True)
@@ -985,6 +1053,10 @@ class BaseResolver:
         self.retry_servfail = False
         self.rotate = False
         self.ndots = None
+        # Single-flight state: maps in-flight resolution keys to events
+        # signaled when the resolution filling the cache completes.
+        self._inflight: dict[CacheKey, threading.Event] = {}
+        self._inflight_lock = threading.Lock()
 
     def read_resolv_conf(self, f: str | os.PathLike | TextIO) -> None:
         """Process *f* as a file in the /etc/resolv.conf format.  If *f* is
@@ -1297,6 +1369,87 @@ class Resolver(BaseResolver):
             available to answer the question.
         :rtype: :py:class:`dns.resolver.Answer`
         """
+
+        if self.cache is not None:
+            # Single-flight: ensure that only one thread does the network
+            # queries filling the cache for a given question.  Concurrent
+            # resolvers of the same question wait for the filler and then
+            # retry, usually getting the result from the cache.
+            if isinstance(qname, str):
+                flight_qname = dns.name.from_text(qname, None)
+            else:
+                flight_qname = qname
+            flight_key = (
+                flight_qname,
+                dns.rdatatype.RdataType.make(rdtype),
+                dns.rdataclass.RdataClass.make(rdclass),
+            )
+            with self._inflight_lock:
+                event = self._inflight.get(flight_key)
+                if event is None:
+                    event = threading.Event()
+                    self._inflight[flight_key] = event
+                    filler = True
+                else:
+                    filler = False
+            if not filler:
+                # Wait for the filler to finish, then try again; the
+                # result will usually come from the cache.  If the
+                # filler's queries failed, nothing will have been cached
+                # and we will become the filler.
+                event.wait()
+                return self.resolve(
+                    qname,
+                    rdtype,
+                    rdclass,
+                    tcp,
+                    source,
+                    raise_on_no_answer,
+                    source_port,
+                    lifetime,
+                    search,
+                )
+            try:
+                return self._resolve(
+                    qname,
+                    rdtype,
+                    rdclass,
+                    tcp,
+                    source,
+                    raise_on_no_answer,
+                    source_port,
+                    lifetime,
+                    search,
+                )
+            finally:
+                with self._inflight_lock:
+                    del self._inflight[flight_key]
+                    event.set()
+        return self._resolve(
+            qname,
+            rdtype,
+            rdclass,
+            tcp,
+            source,
+            raise_on_no_answer,
+            source_port,
+            lifetime,
+            search,
+        )
+
+    def _resolve(
+        self,
+        qname: dns.name.Name | str,
+        rdtype: dns.rdatatype.RdataType | str = dns.rdatatype.A,
+        rdclass: dns.rdataclass.RdataClass | str = dns.rdataclass.IN,
+        tcp: bool = False,
+        source: str | None = None,
+        raise_on_no_answer: bool = True,
+        source_port: int = 0,
+        lifetime: float | None = None,
+        search: bool | None = None,
+    ) -> Answer:
+        """The resolution implementation for resolve()."""
 
         resolution = _Resolution(
             self, qname, rdtype, rdclass, tcp, raise_on_no_answer, search
