@@ -175,10 +175,10 @@ class ResolutionTestCase(unittest.TestCase):
         q1 = dns.message.make_query(qname1, dns.rdatatype.A)
         r1 = self.make_negative_response(q1, True)
         cache_answer = dns.resolver.Answer(
-            qname1, dns.rdatatype.ANY, dns.rdataclass.IN, r1
+            qname1, dns.rdatatype.NXNAME, dns.rdataclass.IN, r1
         )
         self.resolver.cache.put(
-            (qname1, dns.rdatatype.ANY, dns.rdataclass.IN), cache_answer
+            (qname1, dns.rdatatype.NXNAME, dns.rdataclass.IN), cache_answer
         )
         try:
             request, answer = self.resn.next_request()
@@ -200,18 +200,18 @@ class ResolutionTestCase(unittest.TestCase):
         q1 = dns.message.make_query(qname1, dns.rdatatype.A)
         r1 = self.make_negative_response(q1, True)
         cache_answer = dns.resolver.Answer(
-            qname1, dns.rdatatype.ANY, dns.rdataclass.IN, r1
+            qname1, dns.rdatatype.NXNAME, dns.rdataclass.IN, r1
         )
         self.resolver.cache.put(
-            (qname1, dns.rdatatype.ANY, dns.rdataclass.IN), cache_answer
+            (qname1, dns.rdatatype.NXNAME, dns.rdataclass.IN), cache_answer
         )
         q2 = dns.message.make_query(qname2, dns.rdatatype.A)
         r2 = self.make_negative_response(q2, True)
         cache_answer = dns.resolver.Answer(
-            qname2, dns.rdatatype.ANY, dns.rdataclass.IN, r2
+            qname2, dns.rdatatype.NXNAME, dns.rdataclass.IN, r2
         )
         self.resolver.cache.put(
-            (qname2, dns.rdatatype.ANY, dns.rdataclass.IN), cache_answer
+            (qname2, dns.rdatatype.NXNAME, dns.rdataclass.IN), cache_answer
         )
         try:
             request, answer = self.resn.next_request()
@@ -459,7 +459,7 @@ class ResolutionTestCase(unittest.TestCase):
         self.assertTrue(answer is None)
         self.assertTrue(done)
         cache_answer = self.resolver.cache.get(
-            (self.qname, dns.rdatatype.ANY, dns.rdataclass.IN)
+            (self.qname, dns.rdatatype.NXNAME, dns.rdataclass.IN)
         )
         self.assertTrue(cache_answer.response is r)
 

@@ -8,6 +8,15 @@ What's New in dnspython
 
 TBD
 
+* Resolver negative caching no longer stores NXDOMAIN entries under the
+  (qname, ANY, qclass) cache key, where they could collide with genuine
+  ANY-type entries.  NXDOMAIN entries are now keyed by qname using the
+  ``dns.rdatatype.NXNAME`` meta-type, which is not a valid query type, so
+  negative and positive cache key spaces are disjoint.  NODATA (NOERROR
+  with an empty answer) entries continue to be cached under the full
+  (qname, qtype, qclass) key.  Both kinds of negative entries expire
+  according to the RFC 2308 negative caching TTL.
+
 * DNSSEC now supports ML-DSA-44, a post-quantum signature algorithm.
 
 * A "transaction setup" callable may be specified when reading a zone from a file,

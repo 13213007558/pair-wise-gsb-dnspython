@@ -425,6 +425,16 @@ class CacheBase:
 CacheKey = tuple[dns.name.Name, dns.rdatatype.RdataType, dns.rdataclass.RdataClass]
 
 
+# Negative cache entries for NXDOMAIN are stored under the qname with the
+# NXNAME meta-type, so they apply to all qtypes but can never collide with
+# the (qname, qtype, qclass) key of a NODATA or positive entry, as NXNAME
+# is a meta-type and thus not a valid query type.  NODATA (NOERROR with an
+# empty answer) entries are cached under the full (qname, qtype, qclass)
+# key.  Both kinds of negative entries expire according to the SOA
+# negative caching TTL (RFC 2308), as computed by
+# dns.message.QueryMessage.resolve_chaining().
+
+
 class Cache(CacheBase):
     """Simple thread-safe DNS answer cache."""
 
@@ -712,11 +722,12 @@ class _Resolution:
                     else:
                         return (None, answer)
                 answer = self.resolver.cache.get(
-                    (self.qname, dns.rdatatype.ANY, self.rdclass)
+                    (self.qname, dns.rdatatype.NXNAME, self.rdclass)
                 )
-                if answer is not None and answer.response.rcode() == dns.rcode.NXDOMAIN:
-                    # cached NXDOMAIN; record it and continue to next
-                    # name.
+                if answer is not None:
+                    # Cached NXDOMAIN; record it and continue to the next
+                    # name.  NXDOMAIN entries are keyed by qname only (via
+                    # the NXNAME meta-type) as they apply to all qtypes.
                     self.nxdomain_responses[self.qname] = answer.response
                     continue
 
@@ -853,7 +864,7 @@ class _Resolution:
             # if we aren't going to cache it.
             try:
                 answer = Answer(
-                    self.qname, dns.rdatatype.ANY, dns.rdataclass.IN, response
+                    self.qname, dns.rdatatype.NXNAME, self.rdclass, response
                 )
             except Exception as e:
                 self.errors.append(
@@ -871,7 +882,7 @@ class _Resolution:
             self.nxdomain_responses[self.qname] = response
             if self.resolver.cache:
                 self.resolver.cache.put(
-                    (self.qname, dns.rdatatype.ANY, self.rdclass), answer
+                    (self.qname, dns.rdatatype.NXNAME, self.rdclass), answer
                 )
             # Make next_nameserver() return None, so caller breaks its
             # inner loop and calls next_request().
