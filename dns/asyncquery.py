@@ -17,7 +17,6 @@
 
 """Talk to a DNS server."""
 
-import base64
 import contextlib
 import os
 import random
@@ -30,6 +29,7 @@ from typing import Any, cast
 import dns._file_util
 import dns.asyncbackend
 import dns.exception
+import dns.flags
 import dns.inet
 import dns.message
 import dns.name
@@ -47,8 +47,14 @@ from dns.query import (
     UDPMode,
     _check_status,
     _compute_times,
+    _DoHRequest,
+    _DoHResponse,
+    _DoHRetryBudget,
+    _doh_truncation_target,
+    _encode_doh_request,
     _matches_destination,
     _remaining,
+    _validate_doh_response,
     have_doh,
     make_ssl_context,
 )
@@ -530,6 +536,96 @@ def _maybe_get_resolver(
     return resolver
 
 
+async def _async_doh_exchange(
+    q: dns.message.Message,
+    post: bool,
+    send: Any,
+    where: str,
+    validate: bool,
+    http_retries: int,
+    servfail_retries: int,
+    one_rr_per_rrset: bool,
+    ignore_trailing: bool,
+) -> tuple[dns.message.Message, float]:
+    """The async variant of dns.query._doh_exchange().
+
+    *send* is an async callable taking the encoded request and returning a
+    ``_DoHResponse``; it may be called multiple times.  The request is
+    encoded once as immutable bytes, so retries never re-consume a body
+    iterator.
+    """
+    request = _encode_doh_request(q, post)
+    budget = _DoHRetryBudget(http_retries, servfail_retries)
+    while True:
+        response = await send(request)
+        if budget.consume_http(response.status_code):
+            continue
+        r = _validate_doh_response(
+            q, response, where, one_rr_per_rrset, ignore_trailing, validate
+        )
+        if budget.consume_servfail(r.rcode()):
+            continue
+        return r, response.elapsed
+
+
+async def _async_doh_truncation_fallback(
+    q: dns.message.Message,
+    on_truncation: str,
+    where: str,
+    timeout: float | None,
+    source: str | None,
+    source_port: int,
+    one_rr_per_rrset: bool,
+    ignore_trailing: bool,
+    verify: Any,
+    fallback_port: int | None,
+    backend: dns.asyncbackend.Backend | None,
+) -> dns.message.Message:
+    """Retry a truncated DoH query over TCP or DNS-over-TLS."""
+    target = _doh_truncation_target(where)
+    if on_truncation == "tcp":
+        port = fallback_port if fallback_port is not None else 53
+        return await tcp(
+            q,
+            target,
+            timeout=timeout,
+            port=port,
+            source=source,
+            source_port=source_port,
+            one_rr_per_rrset=one_rr_per_rrset,
+            ignore_trailing=ignore_trailing,
+            backend=backend,
+        )
+    else:
+        assert on_truncation == "dot"
+        port = fallback_port if fallback_port is not None else 853
+        if isinstance(verify, ssl.SSLContext):
+            return await tls(
+                q,
+                target,
+                timeout=timeout,
+                port=port,
+                source=source,
+                source_port=source_port,
+                one_rr_per_rrset=one_rr_per_rrset,
+                ignore_trailing=ignore_trailing,
+                ssl_context=verify,
+                backend=backend,
+            )
+        return await tls(
+            q,
+            target,
+            timeout=timeout,
+            port=port,
+            source=source,
+            source_port=source_port,
+            one_rr_per_rrset=one_rr_per_rrset,
+            ignore_trailing=ignore_trailing,
+            verify=verify,
+            backend=backend,
+        )
+
+
 async def https(
     q: dns.message.Message,
     where: str,
@@ -547,6 +643,11 @@ async def https(
     resolver: "dns.asyncresolver.Resolver | None" = None,  # pyright: ignore
     family: int = socket.AF_UNSPEC,
     http_version: HTTPVersion = HTTPVersion.DEFAULT,
+    validate: bool = True,
+    http_retries: int = 0,
+    servfail_retries: int = 0,
+    on_truncation: str = "return",
+    fallback_port: int | None = None,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via DNS-over-HTTPS.
 
@@ -623,8 +724,8 @@ async def https(
         raise ValueError("client parameter must be an httpx2.AsyncClient")
     # pylint: enable=possibly-used-before-assignment
 
-    wire = q.to_wire()
-    headers = {"accept": "application/dns-message"}
+    if on_truncation not in ("return", "tcp", "dot"):
+        raise ValueError(f"invalid on_truncation value {on_truncation!r}")
 
     h1 = http_version in (HTTPVersion.H1, HTTPVersion.DEFAULT)
     h2 = http_version in (HTTPVersion.H2, HTTPVersion.DEFAULT)
@@ -653,58 +754,71 @@ async def https(
         )
 
         cm = httpx2.AsyncClient(  # pyright: ignore
-            http1=h1, http2=h2, verify=verify, transport=transport  # type: ignore
+            http1=h1,
+            http2=h2,
+            verify=verify,
+            transport=transport,  # type: ignore
+            follow_redirects=False,
         )
 
     async with cm as the_client:
         # see https://tools.ietf.org/html/rfc8484#section-4.1.1 for DoH
         # GET and POST examples
-        if post:
-            headers.update(
-                {
-                    "content-type": "application/dns-message",
-                    "content-length": str(len(wire)),
-                }
-            )
-            response = await backend.wait_for(
-                the_client.post(  # pyright: ignore
-                    url,
-                    headers=headers,
-                    content=wire,
-                    extensions=extensions,
-                ),
-                timeout,
-            )
-        else:
-            wire = base64.urlsafe_b64encode(wire).rstrip(b"=")
-            twire = wire.decode()  # httpx2 does a repr() if we give it bytes
-            response = await backend.wait_for(
-                the_client.get(  # pyright: ignore
-                    url,
-                    headers=headers,
-                    params={"dns": twire},
-                    extensions=extensions,
-                ),
-                timeout,
+
+        async def send(request: _DoHRequest) -> _DoHResponse:
+            if post:
+                response = await backend.wait_for(
+                    the_client.post(  # pyright: ignore
+                        url,
+                        headers=request.headers,
+                        content=request.content,
+                        extensions=extensions,
+                    ),
+                    timeout,
+                )
+            else:
+                response = await backend.wait_for(
+                    the_client.get(  # pyright: ignore
+                        url,
+                        headers=request.headers,
+                        params=request.params,
+                        extensions=extensions,
+                    ),
+                    timeout,
+                )
+            return _DoHResponse(
+                response.status_code,
+                response.headers,
+                response.content,
+                response.elapsed.total_seconds(),
             )
 
-    # see https://tools.ietf.org/html/rfc8484#section-4.2.1 for info about DoH
-    # status codes
-    if response.status_code < 200 or response.status_code > 299:
-        raise ValueError(
-            f"{where} responded with status code {response.status_code}"
-            f"\nResponse body: {response.content!r}"
+        r, elapsed = await _async_doh_exchange(
+            q,
+            post,
+            send,
+            where,
+            validate,
+            http_retries,
+            servfail_retries,
+            one_rr_per_rrset,
+            ignore_trailing,
         )
-    r = dns.message.from_wire(
-        response.content,
-        keyring=q.keyring,
-        request_mac=q.request_mac,
-        one_rr_per_rrset=one_rr_per_rrset,
-        ignore_trailing=ignore_trailing,
-    )
-    r.time = response.elapsed.total_seconds()
-    if not q.is_response(r):
-        raise BadResponse
+    r.time = elapsed
+    if r.flags & dns.flags.TC and on_truncation != "return":
+        return await _async_doh_truncation_fallback(
+            q,
+            on_truncation,
+            where,
+            timeout,
+            source,
+            source_port,
+            one_rr_per_rrset,
+            ignore_trailing,
+            verify,
+            fallback_port,
+            backend,
+        )
     return r
 
 

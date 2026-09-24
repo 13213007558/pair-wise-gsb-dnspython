@@ -29,16 +29,18 @@ import struct
 import time
 import urllib.parse
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import dns._features
 import dns._file_util
 import dns._tls_util
 import dns.exception
+import dns.flags
 import dns.inet
 import dns.message
 import dns.name
 import dns.quic
+import dns.rcode
 import dns.rdata
 import dns.rdataclass
 import dns.rdatatype
@@ -428,6 +430,164 @@ class HTTPVersion(enum.IntEnum):
     H3 = 3
 
 
+_DOH_MEDIA_TYPE = "application/dns-message"
+
+
+class _DoHRequest(NamedTuple):
+    """An RFC 8484 DoH request, encoded for the wire.
+
+    The content is immutable ``bytes`` (not an iterator), so retries can
+    safely resend it.
+    """
+
+    headers: dict[str, str]
+    params: dict[str, str] | None
+    content: bytes | None
+
+
+def _encode_doh_request(q: dns.message.Message, post: bool) -> _DoHRequest:
+    """Encode *q* as an RFC 8484 DoH request.
+
+    POST requests carry the wire-format message as the body; GET requests
+    carry it base64url-encoded (without padding) in the ``dns`` parameter.
+    The encoding is deterministic and matches what is sent on the wire, so
+    requests can be reproduced from a packet capture.
+    """
+    wire = q.to_wire()
+    headers = {"accept": _DOH_MEDIA_TYPE}
+    if post:
+        headers["content-type"] = _DOH_MEDIA_TYPE
+        headers["content-length"] = str(len(wire))
+        return _DoHRequest(headers, None, wire)
+    else:
+        encoded = base64.urlsafe_b64encode(wire).rstrip(b"=").decode()
+        return _DoHRequest(headers, {"dns": encoded}, None)
+
+
+class _DoHResponse(NamedTuple):
+    """A transport-neutral DoH HTTP response."""
+
+    status_code: int
+    headers: Any
+    content: bytes
+    elapsed: float
+
+
+def _doh_media_type(headers: Any) -> "str | None":
+    """Return the media type of a DoH response, or ``None`` if not present."""
+    for name, value in headers.items():
+        if name.lower() == "content-type":
+            return value.split(";")[0].strip().lower()
+    return None
+
+
+def _validate_doh_response(
+    q: dns.message.Message,
+    response: _DoHResponse,
+    where: str,
+    one_rr_per_rrset: bool = False,
+    ignore_trailing: bool = False,
+    validate: bool = True,
+) -> dns.message.Message:
+    """Validate and parse a DoH response.
+
+    An HTTP 2xx status is not sufficient; when *validate* is ``True`` the
+    response must also have the ``application/dns-message`` media type and
+    be a DNS response matching the query's question section (qname, qtype,
+    and qclass), opcode, and transaction id.
+    """
+    # See https://tools.ietf.org/html/rfc8484#section-4.2.1 for info about
+    # DoH status codes.
+    if response.status_code < 200 or response.status_code > 299:
+        raise ValueError(
+            f"{where} responded with status code {response.status_code}"
+            f"\nResponse body: {response.content}"
+        )
+    if validate:
+        media_type = _doh_media_type(response.headers)
+        if media_type != _DOH_MEDIA_TYPE:
+            raise BadResponse(
+                f"{where} responded with media type {media_type!r} instead of "
+                f"{_DOH_MEDIA_TYPE!r}"
+            )
+    r = dns.message.from_wire(
+        response.content,
+        keyring=q.keyring,
+        request_mac=q.request_mac,
+        one_rr_per_rrset=one_rr_per_rrset,
+        ignore_trailing=ignore_trailing,
+    )
+    if validate and not q.is_response(r):
+        raise BadResponse(f"{where} responded with a mismatched DNS message")
+    return r
+
+
+class _DoHRetryBudget:
+    """Separate retry budgets for transient HTTP errors and DNS SERVFAIL."""
+
+    def __init__(self, http_retries: int = 0, servfail_retries: int = 0):
+        self.http_retries = http_retries
+        self.servfail_retries = servfail_retries
+
+    def consume_http(self, status_code: int) -> bool:
+        """Consume an HTTP retry for a 429 or 503 status, if budget remains."""
+        if status_code in (429, 503) and self.http_retries > 0:
+            self.http_retries -= 1
+            return True
+        return False
+
+    def consume_servfail(self, rcode: int) -> bool:
+        """Consume a SERVFAIL retry, if budget remains."""
+        if rcode == dns.rcode.SERVFAIL and self.servfail_retries > 0:
+            self.servfail_retries -= 1
+            return True
+        return False
+
+
+def _doh_exchange(
+    q: dns.message.Message,
+    post: bool,
+    send: "Callable[[_DoHRequest], _DoHResponse]",
+    where: str,
+    validate: bool,
+    http_retries: int,
+    servfail_retries: int,
+    one_rr_per_rrset: bool,
+    ignore_trailing: bool,
+) -> "tuple[dns.message.Message, float]":
+    """Send *q* to a DoH server, retrying according to the retry budgets.
+
+    *send* is called with the encoded request and must return a
+    ``_DoHResponse``; it may be called multiple times.  The request is
+    encoded once as immutable bytes, so retries never re-consume a body
+    iterator.
+
+    Returns the response message and the elapsed time of the final attempt.
+    """
+    request = _encode_doh_request(q, post)
+    budget = _DoHRetryBudget(http_retries, servfail_retries)
+    while True:
+        response = send(request)
+        if budget.consume_http(response.status_code):
+            continue
+        r = _validate_doh_response(
+            q, response, where, one_rr_per_rrset, ignore_trailing, validate
+        )
+        if budget.consume_servfail(r.rcode()):
+            continue
+        return r, response.elapsed
+
+
+def _doh_truncation_target(where: str) -> str:
+    """Return the host to use for a TCP/DoT truncation fallback."""
+    if dns.inet.is_address(where):
+        return where
+    hostname = urllib.parse.urlparse(where).hostname
+    if hostname is None:
+        raise ValueError("no hostname in URL")
+    return hostname
+
+
 def https(
     q: dns.message.Message,
     where: str,
@@ -445,6 +605,11 @@ def https(
     resolver: "dns.resolver.Resolver | None" = None,  # pyright: ignore
     family: int = socket.AF_UNSPEC,
     http_version: HTTPVersion = HTTPVersion.DEFAULT,
+    validate: bool = True,
+    http_retries: int = 0,
+    servfail_retries: int = 0,
+    on_truncation: str = "return",
+    fallback_port: int | None = None,
 ) -> dns.message.Message:
     """Return the response obtained after sending a query via DNS-over-HTTPS.
 
@@ -494,7 +659,31 @@ def https(
     :type family: int
     :param http_version: Which HTTP version to use.
     :type http_version: :py:class:`dns.query.HTTPVersion`
+    :param validate: If ``True`` (the default), require the response to
+        have the ``application/dns-message`` media type and to match the
+        query's question section (qname, qtype, and qclass), opcode, and
+        transaction id; an HTTP 2xx status alone is not accepted.
+    :type validate: bool
+    :param http_retries: The number of times to retry when the server
+        responds with an HTTP 429 or 503 status.  This budget is separate
+        from *servfail_retries*.
+    :type http_retries: int
+    :param servfail_retries: The number of times to retry when the server
+        responds with a DNS SERVFAIL rcode.  This budget is separate from
+        *http_retries*.
+    :type servfail_retries: int
+    :param on_truncation: What to do if the response has the TC bit set.
+        If ``return`` (the default), return the truncated response.  If
+        ``tcp`` or ``dot``, retry the query over TCP or
+        DNS-over-TLS respectively, using the host from *where*.
+    :type on_truncation: str
+    :param fallback_port: The port to use for a TCP or DoT truncation
+        fallback.  The default is 53 for TCP and 853 for DoT.
+    :type fallback_port: int or ``None``
     :rtype: :py:class:`dns.message.Message`
+
+    Redirects are not followed; a 3xx response raises a ``ValueError``.
+    This ensures that headers are never forwarded to a different origin.
     """
 
     verify_filename = dns._file_util.as_filename(verify)
@@ -551,8 +740,8 @@ def https(
     if session and not isinstance(session, httpx2.Client):  # pyright: ignore
         raise ValueError("session parameter must be an httpx2.Client")
 
-    wire = q.to_wire()
-    headers = {"accept": "application/dns-message"}
+    if on_truncation not in ("return", "tcp", "dot"):
+        raise ValueError(f"invalid on_truncation value {on_truncation!r}")
 
     h1 = http_version in (HTTPVersion.H1, HTTPVersion.DEFAULT)
     h2 = http_version in (HTTPVersion.H2, HTTPVersion.DEFAULT)
@@ -581,55 +770,121 @@ def https(
         )
 
         cm = httpx2.Client(  # pyright: ignore
-            http1=h1, http2=h2, verify=verify, transport=transport  # type: ignore
+            http1=h1,
+            http2=h2,
+            verify=verify,
+            transport=transport,  # type: ignore
+            follow_redirects=False,
         )
     with cm as session:
         # see https://tools.ietf.org/html/rfc8484#section-4.1.1 for DoH
         # GET and POST examples
         assert session is not None
-        if post:
-            headers.update(
-                {
-                    "content-type": "application/dns-message",
-                    "content-length": str(len(wire)),
-                }
-            )
-            response = session.post(
-                url,
-                headers=headers,
-                content=wire,
-                timeout=timeout,
-                extensions=extensions,
-            )
-        else:
-            wire = base64.urlsafe_b64encode(wire).rstrip(b"=")
-            twire = wire.decode()  # httpx2 does a repr() if we give it bytes
-            response = session.get(
-                url,
-                headers=headers,
-                timeout=timeout,
-                params={"dns": twire},
-                extensions=extensions,
+
+        def send(request: _DoHRequest) -> _DoHResponse:
+            if post:
+                response = session.post(
+                    url,
+                    headers=request.headers,
+                    content=request.content,
+                    timeout=timeout,
+                    extensions=extensions,
+                )
+            else:
+                response = session.get(
+                    url,
+                    headers=request.headers,
+                    timeout=timeout,
+                    params=request.params,
+                    extensions=extensions,
+                )
+            return _DoHResponse(
+                response.status_code,
+                response.headers,
+                response.content,
+                response.elapsed.total_seconds(),
             )
 
-    # see https://tools.ietf.org/html/rfc8484#section-4.2.1 for info about DoH
-    # status codes
-    if response.status_code < 200 or response.status_code > 299:
-        raise ValueError(
-            f"{where} responded with status code {response.status_code}"
-            f"\nResponse body: {response.content}"
+        r, elapsed = _doh_exchange(
+            q,
+            post,
+            send,
+            where,
+            validate,
+            http_retries,
+            servfail_retries,
+            one_rr_per_rrset,
+            ignore_trailing,
         )
-    r = dns.message.from_wire(
-        response.content,
-        keyring=q.keyring,
-        request_mac=q.request_mac,
-        one_rr_per_rrset=one_rr_per_rrset,
-        ignore_trailing=ignore_trailing,
-    )
-    r.time = response.elapsed.total_seconds()
-    if not q.is_response(r):
-        raise BadResponse
+    r.time = elapsed
+    if r.flags & dns.flags.TC and on_truncation != "return":
+        return _doh_truncation_fallback(
+            q,
+            on_truncation,
+            where,
+            timeout,
+            source,
+            source_port,
+            one_rr_per_rrset,
+            ignore_trailing,
+            verify,
+            fallback_port,
+        )
     return r
+
+
+def _doh_truncation_fallback(
+    q: dns.message.Message,
+    on_truncation: str,
+    where: str,
+    timeout: "float | None",
+    source: "str | None",
+    source_port: int,
+    one_rr_per_rrset: bool,
+    ignore_trailing: bool,
+    verify: Any,
+    fallback_port: "int | None",
+) -> dns.message.Message:
+    """Retry a truncated DoH query over TCP or DNS-over-TLS."""
+    target = _doh_truncation_target(where)
+    if on_truncation == "tcp":
+        port = fallback_port if fallback_port is not None else 53
+        return tcp(
+            q,
+            target,
+            timeout=timeout,
+            port=port,
+            source=source,
+            source_port=source_port,
+            one_rr_per_rrset=one_rr_per_rrset,
+            ignore_trailing=ignore_trailing,
+        )
+    else:
+        assert on_truncation == "dot"
+        port = fallback_port if fallback_port is not None else 853
+        if isinstance(verify, ssl.SSLContext):
+            return tls(
+                q,
+                target,
+                timeout=timeout,
+                port=port,
+                source=source,
+                source_port=source_port,
+                one_rr_per_rrset=one_rr_per_rrset,
+                ignore_trailing=ignore_trailing,
+                ssl_context=verify,
+            )
+        return tls(
+            q,
+            target,
+            timeout=timeout,
+            port=port,
+            source=source,
+            source_port=source_port,
+            one_rr_per_rrset=one_rr_per_rrset,
+            ignore_trailing=ignore_trailing,
+            verify=verify,
+        )
 
 
 def _find_header(headers: dns.quic.Headers, name: bytes) -> bytes:
