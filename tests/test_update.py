@@ -19,9 +19,14 @@ import unittest
 import binascii
 
 import dns.update
+import dns.message
+import dns.name
+import dns.rcode
 import dns.rdata
 import dns.rdataset
 import dns.tsigkeyring
+import dns.versioned
+import dns.zone
 
 
 def hextowire(hex):
