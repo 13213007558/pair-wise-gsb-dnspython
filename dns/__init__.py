@@ -67,6 +67,7 @@ __all__ = [
     "wirebase",
     "xfr",
     "zone",
+    "zonemerge",
     "zonetypes",
     "zonefile",
 ]
