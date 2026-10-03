@@ -12,6 +12,7 @@ Dnspython Manual
    resolver
    zone
    zonefile
+   zonemerge
    dnssec
    async
    exceptions

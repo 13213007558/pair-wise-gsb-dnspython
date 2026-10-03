@@ -29,6 +29,9 @@ Core RFCs
 `RFC 1035 <https://tools.ietf.org/html/rfc1035>`_
     The core DNS wire protocol and master file format.
 
+`RFC 1982 <https://tools.ietf.org/html/rfc1982>`_
+    Serial Number Arithmetic.
+
 `RFC 1995 <https://tools.ietf.org/html/rfc1995>`_
     Incremental zone transfer (IXFR).
 
