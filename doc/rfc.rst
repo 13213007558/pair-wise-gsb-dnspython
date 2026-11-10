@@ -188,9 +188,11 @@ AAAA
 CAA
     `RFC 8659 <https://tools.ietf.org/html/rfc8659>`_
 CDNSKEY
-    `RFC 7344 <https://tools.ietf.org/html/rfc7344>`_
+    `RFC 7344 <https://tools.ietf.org/html/rfc7344>`_,
+    `RFC 8078 <https://tools.ietf.org/html/rfc8078>`_
 CDS
-    `RFC 7344 <https://tools.ietf.org/html/rfc7344>`_
+    `RFC 7344 <https://tools.ietf.org/html/rfc7344>`_,
+    `RFC 8078 <https://tools.ietf.org/html/rfc8078>`_
 CNAME
     `RFC 1035 <https://tools.ietf.org/html/rfc1035>`_
 CSYNC
