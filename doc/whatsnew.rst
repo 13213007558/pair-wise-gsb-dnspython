@@ -38,6 +38,20 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* A new ``dns.xfr.AuthenticatedInbound`` class provides a secure entry point
+  for importing raw zone transfer messages received over a custom transport.
+  It binds RFC 8945 TSIG verification to the ``dns.xfr.Inbound`` transaction:
+  each message is parsed from wire bytes with the caller-supplied keyring and
+  request MAC, and the continuous TSIG digest context is maintained across
+  messages.  The first and last messages must carry a valid TSIG, only a
+  bounded run of middle messages may be unsigned, and any insertion, deletion,
+  reordering, or truncation invalidates the running MAC.  The writer
+  transaction is committed only after the transfer is semantically complete
+  and fully authenticated; EOF, cancellation, a bad MAC, a bad SOA, or an IXFR
+  serial problem rolls the transaction back and leaves the previously visible
+  zone untouched.  On success ``finish()`` returns a ``dns.xfr.XfrResult``
+  with the committed SOA serial and the number of messages authenticated.
+
 2.9.2
 -----
 
