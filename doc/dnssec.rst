@@ -20,6 +20,16 @@ DNSSEC Functions
 .. autofunction:: dns.dnssec.sign
 .. autofunction:: dns.dnssec.validate
 .. autofunction:: dns.dnssec.validate_rrsig
+.. autofunction:: dns.dnssec.validate_nsec_negative_proof
+.. autofunction:: dns.dnssec.validate_nsec_negative_message
+.. autoclass:: dns.dnssec.NSECNegativeProof
+   :members:
+.. autoclass:: dns.dnssec.NSECEvidence
+   :members:
+.. autoclass:: dns.dnssec.NegativeProofType
+   :members:
+.. autoclass:: dns.dnssec.NSECRole
+   :members:
 .. autofunction:: dns.dnssec.nsec3_hash
 .. autofunction:: dns.dnssec.make_ds_rdataset()
 .. autofunction:: dns.dnssec.cds_rdataset_to_ds_rdataset()

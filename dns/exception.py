@@ -149,6 +149,23 @@ class ValidationFailure(DNSException):
     """The DNSSEC signature is invalid."""
 
 
+class IncompleteProof(DNSException):
+    """The DNSSEC denial-of-existence proof is incomplete.
+
+    The records provided do not contain enough authenticated material to
+    establish the claimed negative answer; the response must not be treated
+    as a validated NXDOMAIN or NODATA.
+    """
+
+
+class NSEC3Unsupported(DNSException):
+    """The proof uses NSEC3, which is not handled by this routine.
+
+    NSEC3 denial-of-existence proofs require separate NSEC3 handling and must
+    be validated with an NSEC3-capable routine instead.
+    """
+
+
 class DeniedByPolicy(DNSException):
     """Denied by DNSSEC policy."""
 

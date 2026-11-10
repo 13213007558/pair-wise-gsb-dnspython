@@ -120,6 +120,9 @@ DNSSEC RFCs
 `RFC 6840 <https://tools.ietf.org/html/rfc6840>`_
     Clarifications and Implementation Notes.
 
+`RFC 7129 <https://tools.ietf.org/html/rfc7129>`_
+    Authenticated Denial of Existence in the DNS.
+
 `RFC 7583 <https://tools.ietf.org/html/rfc7583>`_
     Key Rollover Timing Considerations.
 

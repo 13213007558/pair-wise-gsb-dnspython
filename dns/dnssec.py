@@ -21,16 +21,19 @@
 
 import base64
 import contextlib
+import dataclasses
 import functools
 import hashlib
 import math
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
+from enum import Enum
 from typing import Union, cast
 
 import dns._features
+import dns.message
 import dns.name
 import dns.node
 import dns.rdata
@@ -44,6 +47,8 @@ import dns.zone
 from dns.dnssectypes import Algorithm, DSDigest, NSEC3Hash
 from dns.exception import AlgorithmKeyMismatch as AlgorithmKeyMismatch
 from dns.exception import DeniedByPolicy, UnsupportedAlgorithm, ValidationFailure
+from dns.exception import IncompleteProof as IncompleteProof
+from dns.exception import NSEC3Unsupported as NSEC3Unsupported
 from dns.rdtypes.ANY.CDNSKEY import CDNSKEY
 from dns.rdtypes.ANY.CDS import CDS
 from dns.rdtypes.ANY.DNSKEY import DNSKEY
@@ -1136,6 +1141,560 @@ def _sign_zone_nsec(
         )
 
 
+class NegativeProofType(Enum):
+    """The kind of authenticated negative answer an NSEC proof establishes."""
+
+    #: The queried name does not exist in the zone (an NXDOMAIN answer).
+    NAME_DOES_NOT_EXIST = 1
+    #: The queried name exists, but has no RRset of the queried type
+    #: (a NODATA answer).
+    TYPE_DOES_NOT_EXIST = 2
+
+
+class NSECRole(Enum):
+    """The role a particular NSEC RRset plays in a negative proof."""
+
+    #: The NSEC proves the closest encloser name exists.
+    CLOSEST_ENCLOSER = 1
+    #: The NSEC's canonical-order interval contains the next closer name.
+    NEXT_CLOSER = 2
+    #: The NSEC's canonical-order interval contains the wildcard
+    #: ``*.<closest encloser>``, proving no matching wildcard exists.
+    WILDCARD_POSSIBILITY = 3
+    #: The NSEC is owned by the queried name itself.
+    EXACT_NAME = 4
+    #: The NSEC is owned by the wildcard ``*.<closest encloser>``.
+    WILDCARD_EXPANSION = 5
+
+
+@dataclasses.dataclass(frozen=True)
+class NSECEvidence:
+    """One NSEC RRset that participates in a negative proof.
+
+    Every entry has an RRSIG RRset that validated against the trusted key
+    set at the validation time, and belongs to the queried zone.
+    """
+
+    #: Every role this NSEC plays in the proof. A single NSEC can cover both
+    #: the next closer name and the possible wildcard, so it may have more
+    #: than one role.
+    roles: tuple[NSECRole, ...]
+    #: The validated NSEC RRset.
+    nsec_rrset: dns.rrset.RRset
+    #: The RRSIG RRset that authenticated *nsec_rrset*.
+    rrsig_rrset: dns.rrset.RRset
+
+    @property
+    def name(self) -> dns.name.Name:
+        """The owner name of the NSEC RRset."""
+        return self.nsec_rrset.name
+
+    @property
+    def nsec(self) -> NSEC:
+        """The single NSEC rdata of the NSEC RRset."""
+        return cast(NSEC, next(iter(self.nsec_rrset)))
+
+    def has_role(self, role: NSECRole) -> bool:
+        """Return whether this evidence entry fulfills *role*."""
+        return role in self.roles
+
+
+@dataclasses.dataclass(frozen=True)
+class NSECNegativeProof:
+    """The result of successfully validating an NSEC negative answer."""
+
+    #: Whether the name is absent entirely, or present without the type.
+    proof: NegativeProofType
+    #: The zone apex that the proof was made in.
+    zone: dns.name.Name
+    #: The closest encloser of the queried name within the zone.
+    closest_encloser: dns.name.Name
+    #: The NSEC RRsets that actually support the conclusion, in proof order.
+    evidence: tuple[NSECEvidence, ...]
+
+    @property
+    def is_nxdomain(self) -> bool:
+        """``True`` if the proof establishes that the name does not exist."""
+        return self.proof == NegativeProofType.NAME_DOES_NOT_EXIST
+
+    @property
+    def is_nodata(self) -> bool:
+        """``True`` if the name exists but has no RRset of the queried type."""
+        return self.proof == NegativeProofType.TYPE_DOES_NOT_EXIST
+
+
+def _order_lt(name1: dns.name.Name, name2: dns.name.Name) -> bool:
+    # Canonical DNS name ordering (RFC 4034 section 6.1); never compare
+    # textual forms.
+    return name1.fullcompare(name2)[1] < 0
+
+
+def _nsec_covers(
+    owner: dns.name.Name,
+    next_name: dns.name.Name,
+    target: dns.name.Name,
+    zone: dns.name.Name,
+) -> bool:
+    """Does the NSEC interval (owner, next_name) canonically contain target?
+
+    The interval is the set of names strictly after *owner* and strictly
+    before *next_name* in the canonical order.  When *next_name* is the zone
+    apex, the interval wraps around the end of the zone.  The endpoints are
+    never covered.
+    """
+    if next_name == zone:
+        # Wrap-around interval: every in-zone name strictly greater than the
+        # NSEC owner is covered (the apex itself is an endpoint, never covered).
+        return _order_lt(owner, target) and target != zone
+    return _order_lt(owner, target) and _order_lt(target, next_name)
+
+
+def _nsec_has_type(nsec: NSEC, rdtype: dns.rdatatype.RdataType | int) -> bool:
+    rdtype = int(rdtype)
+    window = rdtype // 256
+    octet = (rdtype % 256) // 8
+    bit = 0x80 >> (rdtype % 8)
+    for nsec_window, bitmap in nsec.windows:
+        if nsec_window == window:
+            return octet < len(bitmap) and bool(bitmap[octet] & bit)
+        if nsec_window > window:
+            return False
+    return False
+
+
+def _as_absolute_name(
+    value: dns.name.Name | str, origin: dns.name.Name | None, what: str
+) -> dns.name.Name:
+    if isinstance(value, str):
+        value = dns.name.from_text(value, origin)
+    if not value.is_absolute():
+        if origin is None:
+            raise ValidationFailure(f"relative {what} without an origin specified")
+        value = value.derelativize(origin)
+    return value.canonicalize()
+
+
+def _rrset_key(
+    rrset: dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset],
+) -> tuple[dns.name.Name, dns.rdataset.Rdataset]:
+    return _get_rrname_rdataset(rrset)
+
+
+def _absolute_signer(
+    signer: dns.name.Name, origin: dns.name.Name | None
+) -> dns.name.Name:
+    if not signer.is_absolute():
+        if origin is None:
+            raise ValidationFailure("relative RRSIG signer without an origin specified")
+        signer = signer.derelativize(origin)
+    return signer.canonicalize()
+
+
+def _index_nsecs(
+    nsec_rrsets: Iterable[
+        dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]
+    ],
+    origin: dns.name.Name | None,
+) -> dict[dns.name.Name, dns.rdataset.Rdataset]:
+    nsecs: dict[dns.name.Name, dns.rdataset.Rdataset] = {}
+    for item in nsec_rrsets:
+        name, rdataset = _rrset_key(item)
+        name = _as_absolute_name(name, origin, "NSEC owner name")
+        if rdataset.rdtype == dns.rdatatype.NSEC3:
+            raise NSEC3Unsupported(
+                "NSEC3 proofs are not supported by the NSEC validator"
+            )
+        if rdataset.rdtype != dns.rdatatype.NSEC:
+            raise ValidationFailure("expected an NSEC RRset")
+        for rdata in rdataset:
+            if not isinstance(rdata, NSEC):
+                raise ValidationFailure("expected an NSEC rdata")
+        existing = nsecs.get(name)
+        if existing is not None and list(existing) != list(rdataset):
+            raise ValidationFailure("contradictory NSEC rdata at the same owner name")
+        nsecs[name] = rdataset
+    return nsecs
+
+
+def _index_rrsigs(
+    rrsig_rrsets: Iterable[
+        dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]
+    ],
+    origin: dns.name.Name | None,
+) -> dict[dns.name.Name, list[RRSIG]]:
+    rrsigs: dict[dns.name.Name, list[RRSIG]] = {}
+    for item in rrsig_rrsets:
+        name, rdataset = _rrset_key(item)
+        name = _as_absolute_name(name, origin, "RRSIG owner name")
+        if rdataset.rdtype != dns.rdatatype.RRSIG:
+            raise ValidationFailure("expected an RRSIG RRset")
+        for rdata in rdataset:
+            if not isinstance(rdata, RRSIG):
+                raise ValidationFailure("expected an RRSIG rdata")
+            if rdata.type_covered == dns.rdatatype.NSEC3:
+                raise NSEC3Unsupported(
+                    "NSEC3 proofs are not supported by the NSEC validator"
+                )
+            if rdata.type_covered != dns.rdatatype.NSEC:
+                raise ValidationFailure("RRSIG does not cover NSEC")
+        rrsigs.setdefault(name, []).extend(
+            rdata for rdata in rdataset if isinstance(rdata, RRSIG)
+        )
+    return rrsigs
+
+
+def _authenticate_nsec(
+    owner: dns.name.Name,
+    nsec_rdataset: dns.rdataset.Rdataset,
+    rrsigs: dict[dns.name.Name, list[RRSIG]],
+    keys: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset],
+    now: float | None,
+    policy: Policy,
+    origin: dns.name.Name | None,
+) -> tuple[dns.rrset.RRset, dns.rrset.RRset]:
+    """Validate the signature chain for one NSEC RRset.
+
+    Returns the NSEC RRset and the RRSIG RRset that validated it.  Raises
+    :class:`~dns.exception.ValidationFailure` if no usable signature exists or
+    every signature fails.
+    """
+    candidate_rrsigs = rrsigs.get(owner)
+    if not candidate_rrsigs:
+        raise ValidationFailure(f"NSEC at {owner} has no RRSIG")
+
+    nsec_rrset = dns.rrset.from_rdata(owner, nsec_rdataset.ttl, *nsec_rdataset)
+    failures: list[str] = []
+    for rrsig in candidate_rrsigs:
+        signer = _absolute_signer(rrsig.signer, origin)
+        if keys.get(signer) is None:
+            failures.append(f"no trusted key for signer {signer}")
+            continue
+        rrsig_rrset = dns.rrset.from_rdata(owner, rrsig.original_ttl, rrsig)
+        try:
+            _validate_rrsig(
+                (owner, nsec_rdataset),
+                rrsig,
+                keys,
+                origin,
+                now,
+                policy,
+            )
+            return nsec_rrset, rrsig_rrset
+        except (ValidationFailure, UnsupportedAlgorithm) as exc:
+            failures.append(str(exc))
+    raise ValidationFailure(
+        f"NSEC at {owner} has no valid RRSIG: {'; '.join(failures)}"
+    )
+
+
+def _find_closest_encloser(
+    qname: dns.name.Name,
+    nsec_owners: set[dns.name.Name],
+    zone: dns.name.Name,
+) -> dns.name.Name:
+    # The closest encloser is the longest existing ancestor of qname within
+    # the zone.  The zone apex always exists.
+    candidate = qname
+    while candidate != zone:
+        candidate = candidate.parent()
+        if candidate in nsec_owners:
+            return candidate
+    return zone
+
+
+def validate_nsec_negative_proof(
+    qname: dns.name.Name | str,
+    qtype: dns.rdatatype.RdataType | str,
+    keys: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset],
+    nsec_rrsets: Iterable[
+        dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]
+    ],
+    rrsig_rrsets: Iterable[
+        dns.rrset.RRset | tuple[dns.name.Name, dns.rdataset.Rdataset]
+    ],
+    now: float | None = None,
+    origin: dns.name.Name | None = None,
+    policy: Policy | None = None,
+    cname_chain: Iterable[dns.name.Name | str] | None = None,
+) -> NSECNegativeProof:
+    """Validate a traditional NSEC denial-of-existence proof.
+
+    This implements the NSEC parts of RFC 4035 section 5.4 (with the
+    clarifications of RFC 7129).  It distinguishes an authenticated NXDOMAIN
+    (the queried name does not exist) from an authenticated NODATA (the name
+    exists but has no RRset of the queried type), and verifies the closest
+    encloser, next closer, wildcard-possibility, exact-name and
+    wildcard-expansion NSECs that the conclusion depends on, including
+    canonical-order wrap-around at the zone apex.
+
+    Every NSEC used in the conclusion must validate against *keys* at time
+    *now* and be signed by the zone whose apex encloses the queried name;
+    valid NSECs from other zones or unrelated parts of the namespace cannot
+    be stitched into a proof.
+
+    :param qname: The queried name.
+    :type qname: :py:class:`dns.name.Name` or str
+    :param qtype: The queried RR type.
+    :type qtype: :py:class:`dns.rdatatype.RdataType` or str
+    :param keys: The trusted DNSKEY dictionary, keyed by signer name, as used
+        by :func:`validate_rrsig`.
+    :param nsec_rrsets: The NSEC RRsets supplied as proof, each an
+        :py:class:`dns.rrset.RRset` or a ``(name, rdataset)`` tuple.
+    :param rrsig_rrsets: The RRSIG RRsets (covering NSEC) supplied as proof,
+        in the same form.
+    :param now: The fixed validation time in seconds since the epoch. If
+        ``None``, the actual current time is used.
+    :type now: float or ``None``
+    :param origin: Origin used to derelativize any relative names. If
+        ``None`` (the default), all names must be absolute.
+    :type origin: :py:class:`dns.name.Name` or ``None``
+    :param policy: The policy to use. If ``None``,
+        :py:data:`default_policy` is used.
+    :type policy: :py:class:`Policy` or ``None``
+    :param cname_chain: Optional names traversed by a CNAME chain before the
+        negative answer. If given, the last name is the terminal name that
+        the proof must actually cover; the intermediate CNAME RRsets must be
+        validated separately with :func:`validate`.
+    :type cname_chain: iterable of :py:class:`dns.name.Name` or str, or
+        ``None``
+    :raises IncompleteProof: If the records are insufficient to establish
+        the negative answer.
+    :raises ValidationFailure: If the proof is contradictory, a required
+        signature is missing/expired/bad, or records are from the wrong
+        zone.
+    :raises NSEC3Unsupported: If NSEC3 material is presented.
+    :rtype: :py:class:`NSECNegativeProof`
+    """
+
+    if policy is None:
+        policy = default_policy
+    if isinstance(origin, str):
+        origin = dns.name.from_text(origin, dns.name.root)
+
+    qtype = dns.rdatatype.RdataType.make(qtype)
+    qname = _as_absolute_name(qname, origin, "query name")
+
+    chain: list[dns.name.Name] = []
+    if cname_chain is not None:
+        chain = [
+            _as_absolute_name(name, origin, "CNAME chain name") for name in cname_chain
+        ]
+    target = chain[-1] if chain else qname
+
+    nsec_map = _index_nsecs(nsec_rrsets, origin)
+    rrsig_map = _index_rrsigs(rrsig_rrsets, origin)
+
+    if not nsec_map:
+        raise IncompleteProof("no NSEC records provided")
+
+    # The zone is identified by the signer names on the NSEC RRSIGs. Only a
+    # signer whose apex encloses the target can possibly prove this answer.
+    zones: set[dns.name.Name] = set()
+    for nsec_name in nsec_map:
+        for rrsig in rrsig_map.get(nsec_name, ()):
+            zones.add(_absolute_signer(rrsig.signer, origin))
+    if not zones:
+        raise IncompleteProof("no NSEC RRSIGs provided")
+
+    candidate_zones = {zone for zone in zones if target.is_subdomain(zone)}
+    if not candidate_zones:
+        raise ValidationFailure(
+            "no signed NSEC belongs to a zone enclosing the queried name"
+        )
+    if len(candidate_zones) > 1:
+        raise ValidationFailure("NSEC records are signed by multiple enclosing zones")
+    zone = next(iter(candidate_zones))
+
+    # NSECs outside the proving zone (even validly signed ones) cannot take
+    # part in this proof.
+    in_zone = {name for name in nsec_map if name.is_subdomain(zone)}
+    if not in_zone:
+        raise IncompleteProof("no NSEC records belong to the queried zone")
+
+    # Each participating NSEC appears once in evidence, carrying every role
+    # it plays in the proof. Removing any entry (or its RRSIG) breaks it.
+    evidence_by_name: dict[dns.name.Name, NSECEvidence] = {}
+
+    def use(owner: dns.name.Name, role: NSECRole) -> NSECEvidence:
+        if owner not in nsec_map:
+            raise IncompleteProof(f"missing NSEC required for {role.name}: {owner}")
+        if not owner.is_subdomain(zone):
+            raise ValidationFailure(
+                f"NSEC at {owner} is outside the proving zone {zone}"
+            )
+        existing = evidence_by_name.get(owner)
+        if existing is not None:
+            if role not in existing.roles:
+                evidence_by_name[owner] = dataclasses.replace(
+                    existing, roles=(*existing.roles, role)
+                )
+            return evidence_by_name[owner]
+        nsec_rrset, rrsig_rrset = _authenticate_nsec(
+            owner, nsec_map[owner], rrsig_map, keys, now, policy, origin
+        )
+        entry = NSECEvidence((role,), nsec_rrset, rrsig_rrset)
+        evidence_by_name[owner] = entry
+        return entry
+
+    def covering(covered: dns.name.Name, role: NSECRole) -> NSECEvidence | None:
+        # The covering NSEC is the in-zone NSEC with the greatest owner
+        # canonically less than the covered name, whose interval contains it.
+        best: dns.name.Name | None = None
+        for owner in in_zone:
+            nsec = cast(NSEC, next(iter(nsec_map[owner])))
+            next_name = _as_absolute_name(nsec.next, origin, "NSEC next name")
+            if _nsec_covers(owner, next_name, covered, zone):
+                if best is None or _order_lt(best, owner):
+                    best = owner
+        if best is None:
+            return None
+        return use(best, role)
+
+    if target in nsec_map:
+        # The target name exists; this can only be a NODATA proof.
+        exact = use(target, NSECRole.EXACT_NAME)
+        nsec = exact.nsec
+        if _nsec_has_type(nsec, qtype):
+            raise ValidationFailure(
+                f"NSEC at {target} asserts the queried type "
+                f"{dns.rdatatype.to_text(qtype)} exists"
+            )
+        if qtype != dns.rdatatype.CNAME and _nsec_has_type(nsec, dns.rdatatype.CNAME):
+            raise ValidationFailure(
+                f"NSEC at {target} shows a CNAME; validate the CNAME target"
+            )
+        return NSECNegativeProof(
+            NegativeProofType.TYPE_DOES_NOT_EXIST,
+            zone,
+            target,
+            tuple(evidence_by_name.values()),
+        )
+
+    closest_encloser = _find_closest_encloser(target, set(in_zone), zone)
+
+    # (1) The closest encloser must be proven to exist.
+    use(closest_encloser, NSECRole.CLOSEST_ENCLOSER)
+
+    # next closer name: one more label than the closest encloser, taken from
+    # the target (RFC 4035 section 5.4 / RFC 7129).
+    next_closer = dns.name.Name([target.labels[0], *list(closest_encloser.labels)])
+
+    # (2) An NSEC covering the next closer name proves the target name is
+    # absent. This is required for both NXDOMAIN and wildcard NODATA.
+    nc_evidence = covering(next_closer, NSECRole.NEXT_CLOSER)
+    if nc_evidence is None:
+        raise IncompleteProof(f"no NSEC covers the next closer name {next_closer}")
+
+    # A matching wildcard would be "*.<some ancestor of the target>". Walk
+    # the strict ancestors of the target from shallowest (the closest
+    # encloser) to deepest and look for a signed wildcard NSEC at each level;
+    # only the deepest matching one can synthesize the target.
+    wildcard_name: dns.name.Name | None = None
+    # A wildcard "*.<suffix>" matching the target has one fewer label than
+    # the target, so suffix depths run from the closest encloser up to
+    # len(target) - 1.
+    deepest_suffix_depth = len(target.labels) - 1
+    for depth in range(len(closest_encloser.labels), deepest_suffix_depth + 1):
+        _, suffix = target.split(depth)
+        candidate = dns.name.Name([b"*", *list(suffix.labels)])
+        if candidate in nsec_map:
+            wildcard_name = candidate
+            break
+
+    if wildcard_name is not None:
+        # A signed wildcard exists. If it lacks the queried type the answer
+        # is a wildcard NODATA (RFC 7129 section 5.4); if it has the type,
+        # a wildcard answer should have been given instead.
+        wildcard_exact = use(wildcard_name, NSECRole.WILDCARD_EXPANSION)
+        nsec = wildcard_exact.nsec
+        if _nsec_has_type(nsec, qtype):
+            raise ValidationFailure(
+                f"wildcard {wildcard_name} has the queried type, so a "
+                "negative answer is contradicted"
+            )
+        return NSECNegativeProof(
+            NegativeProofType.TYPE_DOES_NOT_EXIST,
+            zone,
+            closest_encloser,
+            tuple(evidence_by_name.values()),
+        )
+
+    # No wildcard NSEC exists, so an NSEC must cover *.<closest encloser>,
+    # proving no wildcard at the closest encloser could have synthesized the
+    # name. It may be the same NSEC as (2).
+    wildcard = dns.name.Name([b"*", *list(closest_encloser.labels)])
+    wildcard_evidence = covering(wildcard, NSECRole.WILDCARD_POSSIBILITY)
+    if wildcard_evidence is None:
+        raise IncompleteProof(f"no NSEC covers the possible wildcard {wildcard}")
+
+    return NSECNegativeProof(
+        NegativeProofType.NAME_DOES_NOT_EXIST,
+        zone,
+        closest_encloser,
+        tuple(evidence_by_name.values()),
+    )
+
+
+def validate_nsec_negative_message(
+    qname: dns.name.Name | str,
+    qtype: dns.rdatatype.RdataType | str,
+    keys: dict[dns.name.Name, dns.node.Node | dns.rdataset.Rdataset],
+    message: dns.message.Message,
+    now: float | None = None,
+    origin: dns.name.Name | None = None,
+    policy: Policy | None = None,
+) -> NSECNegativeProof:
+    """Validate the NSEC denial-of-existence proof in a DNS response.
+
+    This is a convenience wrapper around
+    :func:`validate_nsec_negative_proof` that extracts the NSEC and
+    NSEC-covering RRSIG RRsets from *message*'s answer and authority
+    sections.
+
+    A CNAME chain is not followed here; validate each CNAME RRset with
+    :func:`validate` and, if the negative answer is about the chain's
+    terminal name, call :func:`validate_nsec_negative_proof` directly with
+    that name.
+
+    :param message: A DNS response carrying NSEC and RRSIG records.
+    :type message: :py:class:`dns.message.Message`
+    :raises NSEC3Unsupported: If the message carries NSEC3 records.
+    :rtype: :py:class:`NSECNegativeProof`
+    """
+    nsec_rrsets: list[dns.rrset.RRset] = []
+    rrsig_rrsets: list[dns.rrset.RRset] = []
+    for section in (message.answer, message.authority):
+        for rrset in section:
+            if rrset.rdtype == dns.rdatatype.NSEC:
+                nsec_rrsets.append(rrset)
+            elif rrset.rdtype == dns.rdatatype.NSEC3:
+                raise NSEC3Unsupported(
+                    "NSEC3 proofs are not supported by the NSEC validator"
+                )
+            elif rrset.rdtype == dns.rdatatype.RRSIG:
+                if rrset.covers == dns.rdatatype.NSEC3:
+                    raise NSEC3Unsupported(
+                        "NSEC3 proofs are not supported by the NSEC validator"
+                    )
+                if rrset.covers == dns.rdatatype.NSEC:
+                    rrsig_rrsets.append(rrset)
+
+    return validate_nsec_negative_proof(
+        qname,
+        qtype,
+        keys,
+        nsec_rrsets,
+        rrsig_rrsets,
+        now=now,
+        origin=origin,
+        policy=policy,
+    )
+
+
+_validate_nsec_negative_proof = validate_nsec_negative_proof
+_validate_nsec_negative_message = validate_nsec_negative_message
+
+
 def _need_pyca(*args, **kwargs):
     raise ImportError(
         "DNSSEC validation requires python cryptography"
@@ -1160,6 +1719,8 @@ if dns._features.have("dnssec"):
 
     validate = _validate  # pyright: ignore
     validate_rrsig = _validate_rrsig  # pyright: ignore
+    validate_nsec_negative_proof = _validate_nsec_negative_proof  # pyright: ignore
+    validate_nsec_negative_message = _validate_nsec_negative_message  # pyright: ignore
     sign = _sign
     make_dnskey = _make_dnskey
     make_cdnskey = _make_cdnskey
@@ -1167,6 +1728,8 @@ if dns._features.have("dnssec"):
 else:  # pragma: no cover
     validate = _need_pyca
     validate_rrsig = _need_pyca
+    validate_nsec_negative_proof = _need_pyca
+    validate_nsec_negative_message = _need_pyca
     sign = _need_pyca
     make_dnskey = _need_pyca
     make_cdnskey = _need_pyca
