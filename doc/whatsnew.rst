@@ -38,6 +38,16 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* The new ``dns.updater`` module applies an RFC 2136 dynamic update
+  (``dns.update.UpdateMessage``) to a ``dns.transaction.TransactionManager``
+  such as an in-memory ``dns.zone.Zone`` or ``dns.versioned.Zone``, without
+  running any name service.  It validates the zone section, class and name
+  scope, evaluates all prerequisites against a single pre-update snapshot,
+  and then applies the update section in order inside one writer transaction
+  that is committed in full or rolled back.  TSIG authentication remains the
+  caller's responsibility, and an optional admission callback may constrain
+  the transaction.
+
 2.9.2
 -----
 
