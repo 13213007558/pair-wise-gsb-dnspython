@@ -49,6 +49,8 @@ from dns.rdtypes.ANY.CDS import CDS
 from dns.rdtypes.ANY.DNSKEY import DNSKEY
 from dns.rdtypes.ANY.DS import DS
 from dns.rdtypes.ANY.NSEC import NSEC, Bitmap
+from dns.rdtypes.ANY.NSEC3 import NSEC3, OPTOUT
+from dns.rdtypes.ANY.NSEC3 import Bitmap as NSEC3Bitmap
 from dns.rdtypes.ANY.NSEC3PARAM import NSEC3PARAM
 from dns.rdtypes.ANY.RRSIG import RRSIG, sigtime_to_posixtime
 from dns.rdtypes.dnskeybase import Flag
@@ -714,6 +716,35 @@ def _make_cdnskey(
     )
 
 
+def _nsec3_hash_bytes(
+    domain: dns.name.Name | str,
+    salt: bytes,
+    iterations: int,
+    algorithm: int | str,
+) -> bytes:
+    """Calculate the raw NSEC3 hash of *domain* (RFC 5155 section 5)."""
+
+    try:
+        if isinstance(algorithm, str):
+            algorithm = NSEC3Hash[algorithm.upper()]
+    except Exception:
+        raise ValueError("Wrong hash algorithm (only SHA1 is supported)")
+
+    if algorithm != NSEC3Hash.SHA1:
+        raise ValueError("Wrong hash algorithm (only SHA1 is supported)")
+
+    if not isinstance(domain, dns.name.Name):
+        domain = dns.name.from_text(domain)
+    domain_encoded = domain.canonicalize().to_wire()
+    assert domain_encoded is not None
+
+    digest = hashlib.sha1(domain_encoded + salt).digest()
+    for _ in range(iterations):
+        digest = hashlib.sha1(digest + salt).digest()
+
+    return digest
+
+
 def nsec3_hash(
     domain: dns.name.Name | str,
     salt: str | bytes | None,
@@ -735,15 +766,6 @@ def nsec3_hash(
     :rtype: str
     """
 
-    try:
-        if isinstance(algorithm, str):
-            algorithm = NSEC3Hash[algorithm.upper()]
-    except Exception:
-        raise ValueError("Wrong hash algorithm (only SHA1 is supported)")
-
-    if algorithm != NSEC3Hash.SHA1:
-        raise ValueError("Wrong hash algorithm (only SHA1 is supported)")
-
     if salt is None:
         salt_encoded = b""
     elif isinstance(salt, str):
@@ -754,14 +776,7 @@ def nsec3_hash(
     else:
         salt_encoded = salt
 
-    if not isinstance(domain, dns.name.Name):
-        domain = dns.name.from_text(domain)
-    domain_encoded = domain.canonicalize().to_wire()
-    assert domain_encoded is not None
-
-    digest = hashlib.sha1(domain_encoded + salt_encoded).digest()
-    for _ in range(iterations):
-        digest = hashlib.sha1(digest + salt_encoded).digest()
+    digest = _nsec3_hash_bytes(domain, salt_encoded, iterations, algorithm)
 
     return base64.b32hexencode(digest).decode("utf-8")
 
@@ -959,6 +974,7 @@ def sign_zone(
     expiration: datetime | str | int | float | None = None,
     lifetime: int | None = None,
     nsec3: NSEC3PARAM | None = None,
+    nsec3_optout: bool | None = None,
     rrset_signer: RRsetSigner | None = None,
     policy: Policy | None = None,
     deterministic: bool = True,
@@ -989,8 +1005,22 @@ def sign_zone(
     :param lifetime: The signature lifetime in seconds. Only meaningful if
         *expiration* is ``None``.
     :type lifetime: int or ``None``
-    :param nsec3: If specified, configures signing using NSEC3. Not yet
-        implemented.
+    :param nsec3: If specified, configures signing using NSEC3, using the
+        given NSEC3PARAM parameters (hash algorithm, iterations, and salt).
+        An NSEC3PARAM RR is added at the zone apex, and the zone is given an
+        NSEC3 chain instead of an NSEC chain.
+    :type nsec3: :py:class:`dns.rdtypes.ANY.NSEC3PARAM.NSEC3PARAM` or
+        ``None``
+    :param nsec3_optout: Whether the NSEC3 chain uses the Opt-Out flag
+        (RFC 5155 section 3.1.2). If ``None`` (the default), the flag is
+        taken from *nsec3*'s flags field. If ``True`` or ``False``, it
+        overrides that field. Opt-Out only changes how unsigned
+        delegations (delegation points without a DS RRset) are treated:
+        with Opt-Out they are omitted from the NSEC3 chain entirely,
+        without it they get an NSEC3 RR. The NSEC3PARAM RR at the apex
+        always has a zero flags field as required by RFC 5155
+        section 4.1.2.
+    :type nsec3_optout: bool or ``None``
     :param rrset_signer: An optional function for signing RRsets, accepting
         two arguments: transaction and RRset. If not specified,
         ``dns.dnssec.default_rrset_signer`` is used.
@@ -1040,7 +1070,21 @@ def sign_zone(
                 _txn.add(zone.origin, dnskey_ttl, dnskey)
 
         if nsec3:
-            raise NotImplementedError("Signing with NSEC3 not yet implemented")
+            if nsec3_optout is None:
+                nsec3_optout = bool(nsec3.flags & OPTOUT)
+            _rrset_signer = rrset_signer or functools.partial(
+                default_rrset_signer,
+                signer=zone.origin,
+                ksks=ksks,
+                zsks=zsks,
+                inception=inception,
+                expiration=expiration,
+                lifetime=lifetime,
+                policy=policy,
+                origin=zone.origin,
+                deterministic=deterministic,
+            )
+            _sign_zone_nsec3(zone, _txn, nsec3, nsec3_optout, _rrset_signer)
         else:
             _rrset_signer = rrset_signer or functools.partial(
                 default_rrset_signer,
@@ -1054,7 +1098,7 @@ def sign_zone(
                 origin=zone.origin,
                 deterministic=deterministic,
             )
-            return _sign_zone_nsec(zone, _txn, _rrset_signer)
+            _sign_zone_nsec(zone, _txn, _rrset_signer)
 
 
 def _sign_zone_nsec(
@@ -1134,6 +1178,207 @@ def _sign_zone_nsec(
         _txn_add_nsec(
             txn, last_secure, zone.origin, zone.rdclass, rrsig_ttl, rrset_signer
         )
+
+
+def _nsec3_owner_name(digest: bytes, origin: dns.name.Name) -> dns.name.Name:
+    """Build the NSEC3 owner name (hash label + origin) for *digest*."""
+
+    label = base64.b32hexencode(digest)
+    return dns.name.Name([label]) + origin
+
+
+def _sign_zone_nsec3(
+    zone: dns.zone.Zone,
+    txn: dns.transaction.Transaction,
+    nsec3param: NSEC3PARAM,
+    optout: bool,
+    rrset_signer: RRsetSigner | None = None,
+) -> None:
+    """NSEC3 zone signer (RFC 5155).
+
+    The complete chain is computed in memory before anything is written,
+    so a failure never leaves a partial chain behind.
+    """
+
+    if zone.origin is None:
+        raise ValueError("no zone origin")
+    origin = zone.origin
+    if nsec3param.algorithm != NSEC3Hash.SHA1:
+        raise ValueError("Wrong hash algorithm (only SHA1 is supported)")
+    if nsec3param.flags & ~OPTOUT:
+        raise ValueError("invalid NSEC3 flags")
+
+    algorithm = nsec3param.algorithm
+    iterations = nsec3param.iterations
+    salt = nsec3param.salt
+    nsec3_flags = OPTOUT if optout else 0
+    nsec3_ttl = zone.get_soa(txn).minimum
+
+    # Types belonging to NSEC3 machinery; never part of a regular node's
+    # bitmap and always regenerated by this routine.
+    nsec3_types = {
+        dns.rdatatype.NSEC3,
+        dns.rdatatype.NSEC3PARAM,
+    }
+
+    # First pass: read and classify every secure name without mutating the
+    # zone.  Names below delegations are not part of the signed zone.
+    # Each entry is (absolute name, node, is_delegation, has_ds).
+    entries: list[tuple[dns.name.Name, dns.node.Node | None, bool, bool]] = []
+    delegation: dns.name.Name | None = None
+    for name in sorted(txn.iterate_names()):
+        abs_name = name.derelativize(origin)
+        if delegation and abs_name.is_subdomain(delegation):
+            continue
+        node = txn.get_node(name)
+        if node is not None and (
+            node.get_rdataset(zone.rdclass, dns.rdatatype.NSEC3) is not None
+        ):
+            # A hashed owner name from a previous signing run; it is chain
+            # material, not a regular zone name, so never re-hash it.
+            continue
+        is_delegation = (
+            node is not None
+            and node.get_rdataset(zone.rdclass, dns.rdatatype.NS) is not None
+            and abs_name != origin
+        )
+        if is_delegation:
+            assert node is not None
+            delegation = abs_name
+            has_ds = node.get_rdataset(zone.rdclass, dns.rdatatype.DS) is not None
+        else:
+            delegation = None
+            has_ds = False
+
+        if is_delegation and optout and not has_ds:
+            # Opt-Out unsigned delegations are omitted from the chain.
+            continue
+        entries.append((abs_name, node, is_delegation, has_ds))
+
+    # Synthesize empty non-terminals: every ancestor name of a secure name
+    # that has no node of its own gets an NSEC3 RR.  ENTs below a
+    # delegation were skipped with the delegation above, so only in-zone
+    # ENTs remain.  The worklist is extended in place so that the ancestors
+    # of a synthesized ENT are synthesized as well.  A wildcard owner is
+    # itself a node, so the walk stops at the wildcard label.
+    secure_names = {entry[0] for entry in entries}
+    worklist = list(secure_names)
+    while worklist:
+        abs_name = worklist.pop()
+        if abs_name == origin:
+            # The apex has no in-zone ancestors.
+            continue
+        ancestor = abs_name.parent()
+        while ancestor != origin:
+            if ancestor.is_wild():
+                break
+            if ancestor not in secure_names:
+                secure_names.add(ancestor)
+                entries.append((ancestor, None, False, False))
+                worklist.append(ancestor)
+            ancestor = ancestor.parent()
+
+    # Compute the NSEC3 hash for each name and group names that hash to the
+    # same digest (RFC 5155 section 7.2: collisions share one NSEC3 RR).
+    # groups maps digest -> set of types present in the group's nodes.
+    groups: dict[bytes, set[dns.rdatatype.RdataType]] = {}
+    for abs_name, node, is_delegation, has_ds in entries:
+        digest = _nsec3_hash_bytes(abs_name, salt, iterations, algorithm)
+        type_set = groups.setdefault(digest, set())
+        if node is not None:
+            for rdataset in node.rdatasets:
+                rdtype = rdataset.rdtype
+                if rdtype == dns.rdatatype.RRSIG:
+                    # Signatures are never in an NSEC3 bitmap.
+                    continue
+                if rdtype in nsec3_types:
+                    # Left over from a previous run; regenerated below.
+                    continue
+                if is_delegation and rdtype != dns.rdatatype.DS:
+                    # At a delegation only the DS RRset is secure.
+                    continue
+                type_set.add(rdtype)
+        if is_delegation:
+            # RFC 5155 7.2.3 / 7.2.4: delegation point bitmaps.
+            type_set.add(dns.rdatatype.NS)
+            if has_ds:
+                type_set.add(dns.rdatatype.DS)
+            if not optout:
+                # The NSEC3 RR of an included delegation is itself signed.
+                type_set.add(dns.rdatatype.RRSIG)
+        else:
+            type_set.add(dns.rdatatype.NSEC3)
+            type_set.add(dns.rdatatype.RRSIG)
+
+    # RFC 5155 section 7.3: order NSEC3 RRs by binary hash value and close
+    # the loop from the last hash back to the first.  All chain computation
+    # is now finished; everything below either fully commits or is rolled
+    # back by the transaction, so no half chain is ever visible.
+    ordered = sorted(groups.items())
+
+    # Remove any NSEC3/NSEC3PARAM material (and their RRSIGs) from a
+    # previous signing run, so re-signing cannot accumulate chains for old
+    # parameters.
+    for name in list(txn.iterate_names()):
+        txn.delete(name, dns.rdatatype.NSEC3)
+        txn.delete(name, dns.rdatatype.RRSIG, dns.rdatatype.NSEC3)
+    txn.delete(origin, dns.rdatatype.NSEC3PARAM)
+    txn.delete(origin, dns.rdatatype.RRSIG, dns.rdatatype.NSEC3PARAM)
+
+    # Sign all ordinary RRsets, skipping RRSIGs and the unsigned parts of
+    # delegations, exactly as the NSEC path does.
+    if rrset_signer:
+        for abs_name, node, is_delegation, _has_ds in entries:
+            if node is None:
+                continue
+            name = abs_name.relativize(origin)
+            for rdataset in node.rdatasets:
+                rdtype = rdataset.rdtype
+                if rdtype == dns.rdatatype.RRSIG or rdtype in nsec3_types:
+                    continue
+                if is_delegation and rdtype != dns.rdatatype.DS:
+                    continue
+                rrset = dns.rrset.from_rdata(name, rdataset.ttl, *rdataset)
+                rrset_signer(txn, rrset)
+
+    nsec3param_rrset = dns.rrset.from_rdata(
+        origin,
+        nsec3_ttl,
+        NSEC3PARAM(
+            rdclass=zone.rdclass,
+            rdtype=dns.rdatatype.NSEC3PARAM,
+            algorithm=algorithm,
+            # RFC 5155 4.1.2: the NSEC3PARAM flags field is always zero.
+            flags=0,
+            iterations=iterations,
+            salt=salt,
+        ),
+    )
+    txn.add(nsec3param_rrset)
+    if rrset_signer:
+        rrset_signer(txn, nsec3param_rrset)
+
+    count = len(ordered)
+    for index, (digest, type_set) in enumerate(ordered):
+        next_digest = ordered[(index + 1) % count][0]
+        windows = NSEC3Bitmap.from_rdtypes(list(type_set))
+        nsec3_rrset = dns.rrset.from_rdata(
+            _nsec3_owner_name(digest, origin),
+            nsec3_ttl,
+            NSEC3(
+                rdclass=zone.rdclass,
+                rdtype=dns.rdatatype.NSEC3,
+                algorithm=algorithm,
+                flags=nsec3_flags,
+                iterations=iterations,
+                salt=salt,
+                next=next_digest,
+                windows=windows,
+            ),
+        )
+        txn.add(nsec3_rrset)
+        if rrset_signer:
+            rrset_signer(txn, nsec3_rrset)
 
 
 def _need_pyca(*args, **kwargs):

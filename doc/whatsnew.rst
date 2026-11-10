@@ -38,6 +38,18 @@ What's New in dnspython
   attribute of the result, may now need an ``isinstance()`` check or a cast to
   satisfy a type checker.
 
+* ``dns.dnssec.sign_zone()`` now supports NSEC3 (RFC 5155) in addition to
+  NSEC.  Passing an ``dns.rdtypes.ANY.NSEC3PARAM.NSEC3PARAM`` value in the
+  ``nsec3`` parameter produces an NSEC3 chain and an apex NSEC3PARAM RRset,
+  and the new ``nsec3_optout`` parameter controls the Opt-Out flag.  With
+  Opt-Out, unsigned delegation points (NS names without a DS RRset) are
+  omitted from the chain; without it they get an NSEC3 RR.  Signed
+  delegations, empty non-terminals, wildcards, the zone apex, and hash
+  collisions are all handled per RFC 5155.  Re-signing replaces the previous
+  NSEC3 chain rather than accumulating records, and a failure rolls back
+  without leaving a partial chain.  The default behavior is unchanged and
+  still produces an NSEC chain when ``nsec3`` is not given.
+
 2.9.2
 -----
 
